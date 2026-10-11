@@ -18,10 +18,14 @@ from django.contrib import admin
 from django.urls import path, include
 from django.conf import settings
 from django.conf.urls.static import static
+from .views import api_root
 
 urlpatterns = [
+    path('', api_root, name='api_root'),
     path('admin/', admin.site.urls),
-    path('', include('accreditation.urls')), # Connects your app's URLs
+    path('api/search-guests', include('accreditation.urls')), # Adjust if needed
+    path('api/check-in/', include('accreditation.urls')),
+    path('api/activity-log/', include('accreditation.urls')),
 ]
 
 # This allows Django to serve the QR code images during development
