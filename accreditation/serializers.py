@@ -22,7 +22,7 @@ class AccreditationSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Accreditation
-        fields = ['id', 'ok', 'date', 'time', 'is_accredited', 'kids_count']
+        fields = ['id', 'ok', 'date', 'time', 'is_accredited', 'kids_count', 'guest_name']
 
     def get_kids_count(self, obj):
         return obj.guest.kids.count() if obj.guest else 0
