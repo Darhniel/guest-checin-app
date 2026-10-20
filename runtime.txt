@@ -1,1 +1,55 @@
 python-3.11.5
+
+Here are the answers to your questions. Both are very common scenarios when deploying!
+
+### 1. How to log back in and resume the setup
+If your SSH session drops or you need to close your laptop, you will log back into the VPS as `root` (since that's your main SSH key/password). To get back to your isolated project setup, you just need to "switch" back to the `deploy_gc` user.
+
+**Step-by-step to resume:**
+
+1. **SSH back into the server:**
+   ```bash
+   ssh root@your_vps_ip
+   ```
+2. **Switch to your dedicated user:**
+   ```bash
+   su - deploy_gc
+   ```
+   *(Note: The `-` is very important! It tells Linux to load that user's home directory and environment variables. You will know it worked because your terminal prompt will change from `root@...` to `deploy_gc@...` and you will automatically be in `/home/deploy_gc`).*
+
+3. **Navigate to your project and reactivate the virtual environment:**
+   If you are going to run any `python manage.py` commands, you *must* reactivate the virtual environment, as it deactivates when you log out.
+   ```bash
+   cd guest-checin-app
+   source venv/bin/activate
+   ```
+   *(You will know it's active when you see `(venv)` at the very beginning of your terminal prompt).*
+
+**To go back to root later:** Just type `exit` and press Enter.
+
+---
+
+### 2. Can I edit and update the `.env` file later?
+**Yes, absolutely.** The `.env` file is just a standard plain text file. You can edit it anytime you need to change a secret key, update a database password, or add a new API key.
+
+**How to edit it:**
+1. Ensure you are logged in as `deploy_gc` and inside the project folder.
+2. Run the exact same command you used to create it:
+   ```bash
+   nano .env
+   ```
+3. Use your arrow keys to move around, make your changes, and save it exactly as before:
+   * Press `Ctrl + O` (the letter O, not zero) to **Write Out** (save).
+   * Press `Enter` to confirm the file name.
+   * Press `Ctrl + X` to **Exit** the editor.
+
+#### ⚠️ CRITICAL GOTCHA: Restarting Services
+When you change the `.env` file, **Django and Gunicorn do not automatically know you changed it.** They load environment variables into their memory when they start up. 
+
+If you update your `.env` file, you **must** restart your specific Gunicorn service for the changes to take effect.
+
+Run this command (as `root` or using `sudo` as your user):
+```bash
+sudo systemctl restart gunicorn-gc
+```
+*(If you also changed database settings or added a new dependency, you may also need to run `python manage.py migrate` or restart Nginx, but for simple text changes in `.env`, restarting Gunicorn is enough).*
