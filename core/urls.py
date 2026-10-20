@@ -23,7 +23,7 @@ from .views import api_root
 urlpatterns = [
     path('', api_root, name='api_root'),
     path('admin/', admin.site.urls),
-    path('', include('accreditation.urls')),
+    path('api/', include('accreditation.urls')),
 ]
 
 # This allows Django to serve the QR code images during development
