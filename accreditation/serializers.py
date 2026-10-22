@@ -1,9 +1,19 @@
+from django.db import transaction
 from django.views import generic
 from rest_framework import serializers
 from django.contrib.auth import get_user_model
 from .models import Accreditation, Event, Guest, Kid, Location, GuestCategory, OrganizerAPIKey, UserEventAccess
 
 User = get_user_model()
+
+class ActiveListSerializer(serializers.ListSerializer):
+    """Only expose active rows while still supporting nested writes."""
+
+    def to_representation(self, data):
+        iterable = data.all() if hasattr(data, 'all') else data
+        return super().to_representation(
+            [item for item in iterable if getattr(item, 'is_active', True)]
+        )
 
 class UserSerializer(serializers.ModelSerializer):
     class Meta:
@@ -32,18 +42,25 @@ class UserCreateSerializer(serializers.ModelSerializer):
         return user
 
 class LocationSerializer(serializers.ModelSerializer):
+    id = serializers.IntegerField(required=False)
+
     class Meta:
         model = Location
         fields = ('id', 'name', 'description', 'is_active', 'order')
+        list_serializer_class = ActiveListSerializer
 
 class GuestCategorySerializer(serializers.ModelSerializer):
+    id = serializers.IntegerField(required=False)
+
     class Meta:
         model = GuestCategory
-        fields = ('id', 'name', 'color', 'priority')
+        fields = ('id', 'name', 'color', 'priority', 'is_active')
+        read_only_fields = ('is_active',)
+        list_serializer_class = ActiveListSerializer
 
 class EventSerializer(serializers.ModelSerializer):
-    locations = LocationSerializer(many=True, read_only=True)
-    categories = GuestCategorySerializer(many=True, read_only=True)
+    locations = LocationSerializer(many=True, required=False)
+    categories = GuestCategorySerializer(many=True, required=False)
     created_by = UserSerializer(read_only=True)
     ambassadors = serializers.SerializerMethodField()
 
@@ -51,7 +68,8 @@ class EventSerializer(serializers.ModelSerializer):
         model = Event
         fields = (
             'id', 'name', 'description', 'logo', 'location_text', 
-            'start_date', 'end_date', 'daily_schedule', 'enforce_hours', 'is_active', 
+            'start_date', 'end_date', 'daily_schedule', 'custom_fields_schema',
+            'enforce_hours', 'is_active',
             'created_by', 'created_at', 'locations', 'categories', 'ambassadors'
         )
 
@@ -63,6 +81,81 @@ class EventSerializer(serializers.ModelSerializer):
         
         # Serialize and return the list of users
         return UserSerializer([access.user for access in accesses], many=True).data
+
+    @staticmethod
+    def _sync_locations(event, locations_data):
+        existing = {location.id: location for location in event.locations.all()}
+        kept_ids = []
+
+        for index, location_data in enumerate(locations_data):
+            data = dict(location_data)
+            location_id = data.pop('id', None)
+            data.pop('is_active', None)
+            data['order'] = data.get('order', index)
+
+            location = existing.get(location_id) if location_id else None
+            if location is None:
+                location = Location.objects.create(event=event, **data)
+            else:
+                for attribute, value in data.items():
+                    setattr(location, attribute, value)
+                location.is_active = True
+                location.save()
+
+            kept_ids.append(location.id)
+
+        # Keep historical references intact but hide removed points from the UI.
+        event.locations.exclude(id__in=kept_ids).update(is_active=False)
+
+    @staticmethod
+    def _sync_categories(event, categories_data):
+        existing = {category.id: category for category in event.categories.all()}
+        kept_ids = []
+
+        for category_data in categories_data:
+            data = dict(category_data)
+            category_id = data.pop('id', None)
+            data.pop('is_active', None)
+
+            category = existing.get(category_id) if category_id else None
+            if category is None:
+                category = GuestCategory.objects.create(event=event, **data)
+            else:
+                for attribute, value in data.items():
+                    setattr(category, attribute, value)
+                category.is_active = True
+                category.save()
+
+            kept_ids.append(category.id)
+
+        # Past guests keep their category, but it is no longer offered for new guests.
+        event.categories.exclude(id__in=kept_ids).update(is_active=False)
+
+    @transaction.atomic
+    def create(self, validated_data):
+        locations_data = validated_data.pop('locations', [])
+        categories_data = validated_data.pop('categories', [])
+        event = Event.objects.create(**validated_data)
+
+        self._sync_locations(event, locations_data)
+        self._sync_categories(event, categories_data)
+        return event
+
+    @transaction.atomic
+    def update(self, instance, validated_data):
+        locations_data = validated_data.pop('locations', None)
+        categories_data = validated_data.pop('categories', None)
+
+        for attribute, value in validated_data.items():
+            setattr(instance, attribute, value)
+        instance.save()
+
+        if locations_data is not None:
+            self._sync_locations(instance, locations_data)
+        if categories_data is not None:
+            self._sync_categories(instance, categories_data)
+
+        return instance
 
 class KidSerializer(serializers.ModelSerializer):
     class Meta:
@@ -118,10 +211,20 @@ class AccreditationSerializer(serializers.ModelSerializer):
         return obj.guest.kids.count() if obj.guest else 0
 
 class OrganizerAPIKeySerializer(serializers.ModelSerializer):
+    """Masked representation — the raw key is never returned here."""
+
     class Meta:
         model = OrganizerAPIKey
-        fields = ('id', 'key', 'organizer_name', 'is_active', 'created_at', 'last_used')
-        read_only_fields = ('key',)
+        fields = ('id', 'organizer_name', 'key_prefix', 'is_active', 'created_at', 'last_used')
+        read_only_fields = fields
+
+class OrganizerAPIKeyCreateSerializer(serializers.Serializer):
+    organizer_name = serializers.CharField(max_length=255, trim_whitespace=True)
+
+    def validate_organizer_name(self, value):
+        if not value.strip():
+            raise serializers.ValidationError('Organizer name is required.')
+        return value
 
 class OrganizerGuestSerializer(serializers.Serializer):
     adult_names = serializers.CharField()

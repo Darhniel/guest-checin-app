@@ -1,4 +1,5 @@
 import os
+from datetime import timedelta
 from pathlib import Path
 import dj_database_url
 import sentry_sdk
@@ -112,6 +113,16 @@ CORS_ALLOWED_ORIGINS = [
     "http://localhost:8081", # Expo dev
     "http://localhost:3000", # Next.js dev
 ]
+
+# Simple JWT — without this block the library defaults to 5-minute access
+# tokens, which silently logs dashboard users out mid-session.
+SIMPLE_JWT = {
+    'ACCESS_TOKEN_LIFETIME': timedelta(minutes=60),
+    'REFRESH_TOKEN_LIFETIME': timedelta(days=7),
+    'ROTATE_REFRESH_TOKENS': True,
+    'BLACKLIST_AFTER_ROTATION': False,
+    'AUTH_HEADER_TYPES': ('Bearer',),
+}
 
 
 if SENTRY_DSN:

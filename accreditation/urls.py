@@ -32,8 +32,13 @@ urlpatterns = [
     # Admin Dashboard
     path('admin/dashboard/stats/', views.AdminDashboardStatsView.as_view(), name='admin_dashboard_stats'),
     path('admin/ambassadors/list/', views.AdminAmbassadorListView.as_view(), name='admin_ambassador_list'),
+    path('admin/ambassadors/<int:pk>/', views.AdminAmbassadorDetailView.as_view(), name='admin_ambassador_detail'),
     path('admin/ambassadors/<int:pk>/toggle/', views.AdminAmbassadorToggleView.as_view(), name='admin_ambassador_toggle'),
     path('admin/events/<int:event_id>/assign-bulk/', views.AdminEventAssignBulkView.as_view(), name='admin_event_assign_bulk'),
     path('admin/events/<int:event_id>/analytics/', views.AdminEventAnalyticsView.as_view(), name='admin_event_analytics'),
+    path('admin/reports/', views.AdminReportsListView.as_view(), name='admin_reports'),
+    path('admin/events/<int:event_id>/report/', views.AdminEventReportView.as_view(), name='admin_event_report'),
     path('admin/events/<int:event_id>/custom-fields/', views.EventCustomFieldsView.as_view(), name='event_custom_fields'),
+    path('admin/events/<int:event_id>/api-keys/', views.AdminEventApiKeyListCreateView.as_view(), name='admin_event_api_keys'),
+    path('admin/events/<int:event_id>/api-keys/<int:pk>/', views.AdminEventApiKeyDetailView.as_view(), name='admin_event_api_key_detail'),
 ]

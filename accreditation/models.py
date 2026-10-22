@@ -1,3 +1,4 @@
+import hashlib
 import io
 import os
 import qrcode
@@ -58,6 +59,7 @@ class Event(models.Model):
     start_date = models.DateField()
     end_date = models.DateField()
     daily_schedule = models.JSONField(default=dict, help_text='e.g., {"2026-11-15": {"start": "08:00", "end": "18:00"}}')
+    custom_fields_schema = models.JSONField(default=dict, blank=True, help_text='Extra guest fields, e.g. {"fields": [{"key": "company", "label": "Company", "type": "text"}]}')
     enforce_hours = models.BooleanField(default=True)
     is_active = models.BooleanField(default=True)
     created_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='created_events')
@@ -84,6 +86,7 @@ class GuestCategory(models.Model):
     name = models.CharField(max_length=50)
     color = models.CharField(max_length=7, default='#6B7280', help_text="Hex color code")
     priority = models.IntegerField(default=0)
+    is_active = models.BooleanField(default=True)
 
     class Meta:
         ordering = ['-priority', 'name']
@@ -207,13 +210,28 @@ class Accreditation(models.Model):
 def generate_api_key():
     return secrets.token_urlsafe(32)
 
+
+def hash_api_key(value: str) -> str:
+    return hashlib.sha256(value.encode()).hexdigest()
+
+
 class OrganizerAPIKey(models.Model):
     event = models.ForeignKey(Event, on_delete=models.CASCADE, related_name='api_keys')
-    key = models.CharField(max_length=64, unique=True, default=generate_api_key)
     organizer_name = models.CharField(max_length=255)
+    # Only the SHA-256 digest of the key is ever stored; the raw value is
+    # shown once at creation time and sent to the organizer by the admin.
+    key_hash = models.CharField(max_length=64, unique=True)
+    key_prefix = models.CharField(max_length=12)  # first bytes, for identification only
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='organizer_api_keys'
+    )
     is_active = models.BooleanField(default=True)
     created_at = models.DateTimeField(auto_now_add=True)
     last_used = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ['-created_at']
 
     def __str__(self):
         return f"{self.organizer_name} - {self.event.name}"

@@ -70,5 +70,6 @@ class AccreditationAdmin(admin.ModelAdmin):
 
 @admin.register(OrganizerAPIKey)
 class OrganizerAPIKeyAdmin(admin.ModelAdmin):
-    list_display = ('organizer_name', 'event', 'key', 'is_active', 'last_used')
+    # Full keys are never displayed anywhere: they are hashed at rest.
+    list_display = ('organizer_name', 'event', 'key_prefix', 'is_active', 'last_used')
     list_filter = ('event', 'is_active')

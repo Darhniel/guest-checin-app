@@ -1,19 +1,32 @@
-from rest_framework import generics, status, permissions
+from rest_framework import generics, status, permissions, exceptions
 from rest_framework.response import Response
 from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
 from django.contrib.auth import get_user_model
-from .models import CustomUser, Event, Location, GuestCategory, UserEventAccess
+from .models import (
+    generate_api_key,
+    hash_api_key,
+    CustomUser,
+    Event,
+    Location,
+    GuestCategory,
+    UserEventAccess,
+)
 from .serializers import (
     UserSerializer, UserCreateSerializer, EventSerializer, 
-    LocationSerializer, GuestCategorySerializer, OrganizerGuestSerializer
+    LocationSerializer, GuestCategorySerializer, OrganizerGuestSerializer,
+    OrganizerAPIKeySerializer,
 )
 from django.utils import timezone
 from django.db.models import Q, Count
 from django.db.models.functions import TruncHour
+from django.core.cache import cache
+import hashlib
 from rest_framework.permissions import AllowAny
 from .models import Guest, Kid, Accreditation, OrganizerAPIKey, AuditLog
-from .serializers import GuestSummarySerializer, GuestDetailSerializer, AccreditationSerializer, OrganizerAPIKeySerializer
+from .serializers import GuestSummarySerializer, GuestDetailSerializer, AccreditationSerializer
 import logging
+from datetime import datetime, time, timedelta
+from rest_framework.views import APIView
 from .validators import validate_custom_data
 from .throttles import LoginThrottle
 
@@ -46,7 +59,13 @@ class ChangePasswordView(generics.UpdateAPIView):
 
         if not user.check_password(old_password):
             return Response({'error': 'Wrong password.'}, status=status.HTTP_400_BAD_REQUEST)
-        
+
+        if not new_password or len(new_password) < 8:
+            return Response(
+                {'error': 'The new password must be at least 8 characters.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
         user.set_password(new_password)
         user.first_login = False
         user.save()
@@ -107,7 +126,9 @@ class CategoryListView(generics.ListCreateAPIView):
 
     def get_queryset(self):
         event_id = self.kwargs.get('event_id')
-        return GuestCategory.objects.filter(event_id=event_id).order_by('-priority')
+        return GuestCategory.objects.filter(
+            event_id=event_id, is_active=True
+        ).order_by('-priority')
 
     def perform_create(self, serializer):
         event_id = self.kwargs.get('event_id')
@@ -302,14 +323,27 @@ class SearchGuestsView(generics.ListAPIView):
 # ==========================================
 
 class OrganizerPermission(permissions.BasePermission):
+    """
+    Auth for event organizers. Each key unlocks ingestion for exactly one
+    event. Keys are compared by SHA-256 digest, and failed lookups are
+    rate limited per IP to slow down key-guessing.
+    """
+
+    MAX_REQUESTS_PER_MINUTE = 90
+
     def has_permission(self, request, view):
+        self._throttle(request)
+
         api_key = request.headers.get('Authorization')
         if not api_key or not api_key.startswith('Bearer '):
             return False
-        
-        key_value = api_key.split(' ')[1]
+
+        key_value = api_key.split(' ', 1)[1].strip()
+        key_hash = hash_api_key(key_value)
         try:
-            request.organizer_key = OrganizerAPIKey.objects.select_related('event').get(key=key_value, is_active=True)
+            request.organizer_key = OrganizerAPIKey.objects.select_related(
+                'event'
+            ).get(key_hash=key_hash, is_active=True)
             # Update last used
             request.organizer_key.last_used = timezone.now()
             request.organizer_key.save(update_fields=['last_used'])
@@ -317,48 +351,27 @@ class OrganizerPermission(permissions.BasePermission):
         except OrganizerAPIKey.DoesNotExist:
             return False
 
-class OrganizerBulkGuestView(generics.CreateAPIView):
-    authentication_classes = []
-    permission_classes = (OrganizerPermission,)
-    
-    def create(self, request, *args, **kwargs):
-        event = request.organizer_key.event
-        guests_data = request.data.get('guests', [])
-        
-        if not isinstance(guests_data, list):
-            return Response({'error': 'Expected a list of guests'}, status=400)
+    def _throttle(self, request):
+        ident = request.META.get('REMOTE_ADDR') or 'unknown'
+        # Accept proxies we control; header spoofing is handled upstream.
+        forwarded = request.headers.get('X-Forwarded-For')
+        if forwarded:
+            ident = forwarded.split(',')[0].strip() or ident
 
-        created_count = 0
-        for g_data in guests_data:
-            # Basic validation
-            if not g_data.get('adult_names') or not g_data.get('email'):
-                continue
-                
-            kids_data = g_data.pop('kids', [])
-            
-            guest, created = Guest.objects.get_or_create(
-                event=event,
-                email=g_data.get('email'),
-                defaults={**g_data, 'event': event}
+        cache_key = f'organizer_key_throttle:{ident}'
+        count = cache.get(cache_key)
+        if count is None:
+            cache.add(cache_key, 1, 60)
+            return
+        try:
+            count = cache.incr(cache_key)
+        except ValueError:
+            cache.add(cache_key, 1, 60)
+            return
+        if count > self.MAX_REQUESTS_PER_MINUTE:
+            raise exceptions.Throttled(
+                detail='Too many requests from your IP. Try again shortly.'
             )
-            
-            if created:
-                created_count += 1
-                # Create kids if provided
-                for k_data in kids_data:
-                    Kid.objects.get_or_create(guest=guest, defaults=k_data)
-                    
-                AuditLog.objects.create(
-                    action='api_guest_create',
-                    resource_type='Guest',
-                    resource_id=guest.id,
-                    details={'organizer': request.organizer_key.organizer_name}
-                )
-
-        return Response({
-            'message': f'Successfully processed {len(guests_data)} guests. Created {created_count} new records.',
-            'created_count': created_count
-        }, status=201)
 
 class AdminDashboardStatsView(generics.RetrieveAPIView):
     """Overall stats for the admin dashboard"""
@@ -420,6 +433,23 @@ class AdminAmbassadorToggleView(generics.UpdateAPIView):
         })
 
 
+class AdminAmbassadorDetailView(generics.RetrieveUpdateDestroyAPIView):
+    """Permanently delete an ambassador (admin only)."""
+    serializer_class = UserSerializer
+    permission_classes = (permissions.IsAuthenticated,)
+
+    def get_queryset(self):
+        if self.request.user.role != 'admin':
+            return CustomUser.objects.none()
+        return CustomUser.objects.filter(role='ambassador')
+
+    def destroy(self, request, *args, **kwargs):
+        user = self.get_object()
+        label = user.full_name or user.email
+        user.delete()
+        return Response({'message': f'{label} was deleted.'}, status=status.HTTP_200_OK)
+
+
 class AdminEventAssignBulkView(generics.CreateAPIView):
     """Assign multiple ambassadors to an event at once"""
     permission_classes = (permissions.IsAuthenticated,)
@@ -446,6 +476,25 @@ class AdminEventAssignBulkView(generics.CreateAPIView):
         return Response({
             'message': f'Assigned {created} ambassador(s) to event.',
             'assigned_count': created
+        })
+
+    def delete(self, request, *args, **kwargs):
+        """Remove one or more ambassadors from an event without deleting them."""
+        if request.user.role != 'admin':
+            return Response({'error': 'Admin only'}, status=403)
+
+        event_id = kwargs.get('event_id')
+        user_ids = request.data.get('user_ids') or []
+        if not user_ids:
+            return Response({'error': 'user_ids is required'}, status=400)
+
+        removed, _ = UserEventAccess.objects.filter(
+            event_id=event_id, user_id__in=user_ids
+        ).delete()
+
+        return Response({
+            'message': f'Unassigned {removed} ambassador(s) from this event.',
+            'removed_count': removed
         })
 
 
@@ -504,6 +553,12 @@ class OrganizerBulkGuestView(generics.CreateAPIView):
         if not isinstance(guests_data, list):
             return Response({'error': 'Expected a list of guests'}, status=400)
 
+        if len(guests_data) > 1000:
+            return Response(
+                {'error': 'Send at most 1000 guests per request. Split your list into smaller batches.'},
+                status=400
+            )
+
         created_count = 0
         errors_list = []
         
@@ -520,22 +575,46 @@ class OrganizerBulkGuestView(generics.CreateAPIView):
                 if category_name:
                     category = GuestCategory.objects.filter(
                         event=event,
-                        name__iexact=category_name
+                        name__iexact=category_name,
+                        is_active=True
                     ).first()
                 
                 # Create guest
                 kids_data = g_data.pop('kids', [])
-                
-                guest, created = Guest.objects.get_or_create(
-                    event=event,
-                    email=g_data.get('email', ''),
-                    defaults={
-                        'adult_names': g_data['adult_names'],
-                        'phone': g_data.get('phone', ''),
-                        'category': category,
-                        'custom_data': custom_data,
-                    }
-                )
+                adult_names = (g_data.get('adult_names') or '').strip()
+                if not adult_names:
+                    raise ValueError('adult_names is required')
+                email = (g_data.get('email') or '').strip()
+
+                if email:
+                    # Deduplicate on email, and refresh the name if changed.
+                    guest, created = Guest.objects.get_or_create(
+                        event=event,
+                        email=email,
+                        defaults={
+                            'adult_names': adult_names,
+                            'phone': g_data.get('phone', ''),
+                            'category': category,
+                            'custom_data': custom_data,
+                        }
+                    )
+                    if not created and adult_names and adult_names != guest.adult_names:
+                        guest.adult_names = adult_names
+                        guest.save(update_fields=['adult_names'])
+                else:
+                    # No email: deduplicate on the guest's own name so unique
+                    # attendees without an email are no longer collapsed
+                    # into a single record.
+                    guest, created = Guest.objects.get_or_create(
+                        event=event,
+                        adult_names=adult_names,
+                        email='',
+                        defaults={
+                            'phone': g_data.get('phone', ''),
+                            'category': category,
+                            'custom_data': custom_data,
+                        }
+                    )
                 
                 if created:
                     created_count += 1
@@ -560,6 +639,89 @@ class OrganizerBulkGuestView(generics.CreateAPIView):
             'created_count': created_count,
             'errors': errors_list if errors_list else None
         }, status=201)
+class AdminEventApiKeyListCreateView(generics.ListCreateAPIView):
+    """
+    Organizer API keys for one event (admin only).
+
+    POST generates a fresh key and returns the raw value exactly once —
+    it is never retrievable afterwards, only its SHA-256 digest is stored.
+    GET lists keys masked to their prefix.
+    """
+    permission_classes = (permissions.IsAuthenticated,)
+    serializer_class = OrganizerAPIKeySerializer
+
+    def get_queryset(self):
+        if self.request.user.role != 'admin':
+            return OrganizerAPIKey.objects.none()
+        return OrganizerAPIKey.objects.filter(
+            event_id=self.kwargs.get('event_id')
+        )
+
+    def create(self, request, *args, **kwargs):
+        from .serializers import OrganizerAPIKeyCreateSerializer
+
+        if request.user.role != 'admin':
+            return Response({'error': 'Admin only'}, status=403)
+
+        event = Event.objects.filter(id=kwargs.get('event_id')).first()
+        if not event:
+            return Response({'error': 'Event not found.'}, status=404)
+
+        serializer = OrganizerAPIKeyCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        raw_key = generate_api_key()
+        key_record = OrganizerAPIKey.objects.create(
+            event=event,
+            organizer_name=serializer.validated_data['organizer_name'],
+            key_hash=hash_api_key(raw_key),
+            key_prefix=raw_key[:8],
+            created_by=request.user,
+        )
+
+        AuditLog.objects.create(
+            user=request.user,
+            action='organizer_api_key_create',
+            resource_type='OrganizerAPIKey',
+            resource_id=key_record.id,
+            details={'event_id': event.id, 'organizer': key_record.organizer_name}
+        )
+
+        return Response({
+            'message': 'API key created. This is the only time the full key is shown — copy it now.',
+            'id': key_record.id,
+            'organizer_name': key_record.organizer_name,
+            'key_prefix': key_record.key_prefix,
+            # Shown once; hashed (never stored in plaintext) afterwards.
+            'api_key': raw_key,
+        }, status=status.HTTP_201_CREATED)
+
+
+class AdminEventApiKeyDetailView(generics.DestroyAPIView):
+    """Revoke an organizer API key (admin only). The key stops working immediately."""
+    permission_classes = (permissions.IsAuthenticated,)
+
+    def get_queryset(self):
+        if self.request.user.role != 'admin':
+            return OrganizerAPIKey.objects.none()
+        return OrganizerAPIKey.objects.filter(event_id=self.kwargs.get('event_id'))
+
+    def destroy(self, request, *args, **kwargs):
+        key_record = self.get_object()
+        key_record.is_active = False
+        key_record.save(update_fields=['is_active'])
+
+        AuditLog.objects.create(
+            user=request.user,
+            action='organizer_api_key_revoke',
+            resource_type='OrganizerAPIKey',
+            resource_id=key_record.id,
+            details={'event_id': key_record.event_id, 'organizer': key_record.organizer_name}
+        )
+
+        return Response({'message': 'API key revoked.'}, status=status.HTTP_200_OK)
+
+
 class EventCustomFieldsView(generics.RetrieveUpdateAPIView):
     """Get or update custom field schema for an event"""
     permission_classes = (permissions.IsAuthenticated,)
@@ -600,3 +762,349 @@ class EventCustomFieldsView(generics.RetrieveUpdateAPIView):
             'message': 'Custom fields schema updated',
             'schema': event.custom_fields_schema
         })
+
+
+# ==========================================
+# Reporting
+# ==========================================
+
+MAX_REPORT_DAYS = 62
+
+
+def _daily_series(event, daily_rows):
+    """Every scheduled day of the event, filled with zeros where needed."""
+    totals = {row['date']: row for row in daily_rows}
+    series = []
+    cursor = event.start_date
+    end = event.end_date
+
+    if not cursor or not end or cursor > end:
+        return series
+
+    while cursor <= end and len(series) < MAX_REPORT_DAYS:
+        row = totals.get(cursor)
+        series.append({
+            'date': cursor.isoformat(),
+            'checkins': row['checkins'] if row else 0,
+            'guests': row['guests'] if row else 0,
+        })
+        cursor += timedelta(days=1)
+
+    return series
+
+
+def _event_summary(event):
+    """Cheap report aggregates (no guest list) for an event."""
+    today = timezone.localdate()
+    accreditations = Accreditation.objects.filter(event=event, is_accredited=True)
+
+    total_guests = Guest.objects.filter(event=event).count()
+    accredited_guests = accreditations.values('guest_id').distinct().count()
+    total_checkins = accreditations.count()
+    checked_in_today = accreditations.filter(date=today).count()
+
+    daily_rows = list(
+        accreditations.values('date')
+        .annotate(checkins=Count('id'), guests=Count('guest', distinct=True))
+        .order_by('date')
+    )
+    first = accreditations.order_by('date', 'time').values('date', 'time').first()
+    last = accreditations.order_by('-date', '-time').values('date', 'time').first()
+
+    attendance_rate = (
+        round((accredited_guests / total_guests) * 100, 1) if total_guests else 0.0
+    )
+
+    return {
+        'total_guests': total_guests,
+        'accredited_guests': accredited_guests,
+        'total_checkins': total_checkins,
+        'checked_in_today': checked_in_today,
+        'attendance_rate': attendance_rate,
+        'no_shows': max(0, total_guests - accredited_guests),
+        'locations': event.locations.filter(is_active=True).count(),
+        'categories': event.categories.filter(is_active=True).count(),
+        'ambassadors': UserEventAccess.objects.filter(
+            event=event, user__is_active=True
+        ).count(),
+        'first_checkin_date': (
+            first['date'].isoformat() if first and first.get('date') else None
+        ),
+        'last_checkin_at': (
+            datetime.combine(last['date'], last['time'] or time.min).isoformat()
+            if last and last.get('date')
+            else None
+        ),
+        'avg_checkins_per_day': (
+            round(total_checkins / len(daily_rows), 1) if daily_rows else 0.0
+        ),
+        'daily': _daily_series(event, daily_rows),
+    }
+
+
+def _hour_range(event, observed_hours=None):
+    """Chart window: the event's daily schedule plus any hour with data."""
+    starts = []
+    ends = []
+
+    for window in (event.daily_schedule or {}).values():
+        if not isinstance(window, dict):
+            continue
+        for key, bucket in (('start', starts), ('end', ends)):
+            value = str(window.get(key) or '')
+            if ':' not in value:
+                continue
+            try:
+                bucket.append(int(value.split(':')[0]))
+            except (TypeError, ValueError):
+                continue
+
+    observed = [hour for hour in (observed_hours or []) if 0 <= hour <= 23]
+    start_hour = min(starts + observed) if (starts or observed) else 8
+    end_hour = max([end - 1 for end in ends] + observed) if (ends or observed) else 19
+
+    start_hour = max(0, start_hour)
+    end_hour = min(23, end_hour)
+
+    if end_hour < start_hour:
+        return 0, 23
+
+    return start_hour, end_hour
+
+
+def _event_report(event):
+    """Full report payload for a single event, including the guest list."""
+    accreditations = Accreditation.objects.filter(event=event, is_accredited=True)
+    summary = _event_summary(event)
+    total_checkins = summary['total_checkins']
+
+    hourly_counts = {}
+    for checked_at in accreditations.values_list('time', flat=True):
+        hour = checked_at.hour if checked_at else 0
+        hourly_counts[hour] = hourly_counts.get(hour, 0) + 1
+
+    start_hour, end_hour = _hour_range(event, hourly_counts.keys())
+    hourly = [
+        {'hour': f'{hour:02d}:00', 'count': hourly_counts.get(hour, 0)}
+        for hour in range(start_hour, end_hour + 1)
+    ]
+
+    guest_counts = {
+        row['category_id']: row['count']
+        for row in Guest.objects.filter(event=event)
+        .values('category_id')
+        .annotate(count=Count('id'))
+    }
+    checked_by_category = {
+        row['guest__category_id']: row
+        for row in accreditations.values('guest__category_id').annotate(
+            checkins=Count('id'), guests=Count('guest', distinct=True)
+        )
+    }
+
+    by_category = []
+    for category in event.categories.all():
+        guests = guest_counts.get(category.id, 0)
+        checked = checked_by_category.get(category.id, {})
+        checked_guests = checked.get('guests', 0)
+        by_category.append({
+            'id': category.id,
+            'name': category.name,
+            'color': category.color,
+            'guests': guests,
+            'checked_in': checked_guests,
+            'checkins': checked.get('checkins', 0),
+            'rate': round((checked_guests / guests) * 100, 1) if guests else 0.0,
+        })
+
+    uncategorized_guests = guest_counts.get(None, 0)
+    if uncategorized_guests:
+        checked = checked_by_category.get(None, {})
+        checked_guests = checked.get('guests', 0)
+        by_category.append({
+            'id': None,
+            'name': 'Uncategorized',
+            'color': '#94A3B8',
+            'guests': uncategorized_guests,
+            'checked_in': checked_guests,
+            'checkins': checked.get('checkins', 0),
+            'rate': (
+                round((checked_guests / uncategorized_guests) * 100, 1)
+                if uncategorized_guests
+                else 0.0
+            ),
+        })
+
+    by_location = [
+        {
+            'name': row['location__name'] or 'No location',
+            'count': row['count'],
+            'share': (
+                round((row['count'] / total_checkins) * 100, 1)
+                if total_checkins
+                else 0.0
+            ),
+        }
+        for row in accreditations.values('location__name')
+        .annotate(count=Count('id'))
+        .order_by('-count')
+    ]
+
+    by_ambassador = [
+        {
+            'name': row['verified_by__full_name'] or 'Unassigned',
+            'email': row['verified_by__email'] or '',
+            'count': row['count'],
+        }
+        for row in accreditations.values(
+            'verified_by__full_name', 'verified_by__email'
+        )
+        .annotate(count=Count('id'))
+        .order_by('-count')
+    ]
+
+    first_checkin = {}
+    last_checkin = {}
+    for row in accreditations.order_by(
+        'guest_id', 'date', 'time'
+    ).values('guest_id', 'date', 'time', 'location__name'):
+        first_checkin.setdefault(row['guest_id'], row)
+        last_checkin[row['guest_id']] = row
+
+    guest_queryset = (
+        Guest.objects.filter(event=event)
+        .select_related('category')
+        .prefetch_related('kids')
+        .annotate(
+            checkin_count=Count(
+                'accreditations', filter=Q(accreditations__is_accredited=True)
+            )
+        )
+        .order_by('adult_names')
+    )
+
+    guests = []
+    for guest in guest_queryset:
+        first = first_checkin.get(guest.id)
+        last = last_checkin.get(guest.id)
+        guests.append({
+            'id': guest.id,
+            'ticket_number': guest.ticket_number,
+            'adult_names': guest.adult_names,
+            'email': guest.email,
+            'phone': guest.phone,
+            'category': guest.category.name if guest.category else None,
+            'category_color': guest.category.color if guest.category else None,
+            'kids_count': len(guest.kids.all()),
+            'custom_data': guest.custom_data or {},
+            'checked_in': guest.checkin_count > 0,
+            'checkins': guest.checkin_count,
+            'first_checkin_date': (
+                first['date'].isoformat() if first and first.get('date') else None
+            ),
+            'last_checkin_date': (
+                last['date'].isoformat() if last and last.get('date') else None
+            ),
+            'last_checkin_time': (
+                last['time'].isoformat()
+                if last and last.get('time')
+                else None
+            ),
+            'location': last['location__name'] if last else None,
+        })
+
+    recent_checkins = [
+        {
+            'guest_name': row.guest.adult_names,
+            'category': row.guest.category.name if row.guest.category else None,
+            'location': row.location.name if row.location else None,
+            'ambassador': row.verified_by.full_name if row.verified_by else None,
+            'date': row.date.isoformat(),
+            'time': row.time.isoformat() if row.time else None,
+        }
+        for row in accreditations.select_related(
+            'guest__category', 'location', 'verified_by'
+        ).order_by('-date', '-time')[:12]
+    ]
+
+    summary_payload = {key: value for key, value in summary.items() if key != 'daily'}
+
+    return {
+        'event': EventSerializer(event).data,
+        'generated_at': timezone.now().isoformat(),
+        'summary': summary_payload,
+        'daily': summary['daily'],
+        'hourly': hourly,
+        'by_category': by_category,
+        'by_location': by_location,
+        'by_ambassador': by_ambassador,
+        'recent_checkins': recent_checkins,
+        'guests': guests,
+        'custom_fields': (event.custom_fields_schema or {}).get('fields', []),
+    }
+
+
+class AdminReportsListView(APIView):
+    """Summary of every event, used by the reports index page."""
+
+    permission_classes = (permissions.IsAuthenticated,)
+
+    def get(self, request, *args, **kwargs):
+        if request.user.role != 'admin':
+            return Response({'error': 'Admin only'}, status=403)
+
+        events = Event.objects.select_related('created_by').prefetch_related(
+            'locations', 'categories'
+        ).order_by('-start_date')
+
+        reports = []
+        totals = {
+            'events': 0,
+            'total_guests': 0,
+            'accredited_guests': 0,
+            'total_checkins': 0,
+            'checked_in_today': 0,
+            'attendance_rate': 0.0,
+        }
+
+        for event in events:
+            summary = _event_summary(event)
+            reports.append({
+                'event': EventSerializer(event).data,
+                **summary,
+            })
+            for key in (
+                'total_guests',
+                'accredited_guests',
+                'total_checkins',
+                'checked_in_today',
+            ):
+                totals[key] += summary[key]
+
+        totals['events'] = len(reports)
+        totals['attendance_rate'] = (
+            round((totals['accredited_guests'] / totals['total_guests']) * 100, 1)
+            if totals['total_guests']
+            else 0.0
+        )
+
+        return Response({'reports': reports, 'totals': totals})
+
+
+class AdminEventReportView(APIView):
+    """Detailed report for a single event."""
+
+    permission_classes = (permissions.IsAuthenticated,)
+
+    def get(self, request, event_id, *args, **kwargs):
+        if request.user.role != 'admin':
+            return Response({'error': 'Admin only'}, status=403)
+
+        try:
+            event = Event.objects.select_related('created_by').prefetch_related(
+                'locations', 'categories'
+            ).get(pk=event_id)
+        except Event.DoesNotExist:
+            return Response({'error': 'Event not found'}, status=404)
+
+        return Response(_event_report(event))
