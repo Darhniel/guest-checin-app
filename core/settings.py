@@ -10,7 +10,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 SENTRY_DSN = os.environ.get('SENTRY_DSN')
 
 SECRET_KEY = os.environ.get('DJANGO_SECRET_KEY', 'your-dev-secret-key-change-me')
-DEBUG = 'False'
+DEBUG = False
 ALLOWED_HOSTS = os.environ.get('ALLOWED_HOSTS', '*').split(',')
 
 INSTALLED_APPS = [
