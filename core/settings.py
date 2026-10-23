@@ -4,14 +4,23 @@ from pathlib import Path
 import dj_database_url
 import sentry_sdk
 from sentry_sdk.integrations.django import DjangoIntegration
+from django.core.exceptions import ImproperlyConfigured
+
+def get_env_variable(var_name, default=None):
+    """Get the environment variable or return exception/default."""
+    value = os.environ.get(var_name, default)
+    if value is None and default is None:
+        error_msg = f"Set the {var_name} environment variable"
+        raise ImproperlyConfigured(error_msg)
+    return value
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 SENTRY_DSN = os.environ.get('SENTRY_DSN')
 
-SECRET_KEY = os.environ.get('DJANGO_SECRET_KEY', 'your-dev-secret-key-change-me')
+SECRET_KEY = os.environ.get('DJANGO_SECRET_KEY')
 DEBUG = False
-ALLOWED_HOSTS = os.environ.get('ALLOWED_HOSTS', '*').split(',')
+ALLOWED_HOSTS = os.environ.get('ALLOWED_HOSTS', 'localhost, 127.0.0.1').split(',')
 
 INSTALLED_APPS = [
     'django.contrib.admin',
