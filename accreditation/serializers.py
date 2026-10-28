@@ -168,10 +168,13 @@ class GuestSummarySerializer(serializers.ModelSerializer):
     category_color = serializers.CharField(source='category.color', read_only=True)
     kids_count = serializers.SerializerMethodField()
     is_checked_in_today = serializers.SerializerMethodField()
+    # Deprecated read-only alias so already-installed mobile clients keep
+    # working while they move from `adult_names` to `names`.
+    adult_names = serializers.CharField(source='names', read_only=True)
 
     class Meta:
         model = Guest
-        fields = ('id', 'adult_names', 'category_name', 'category_color', 'kids_count', 'is_checked_in_today', 'ticket_number')
+        fields = ('id', 'names', 'adult_names', 'category_name', 'category_color', 'kids_count', 'is_checked_in_today', 'ticket_number')
 
     def get_kids_count(self, obj):  # ✅ FIXED: Use method instead of source
         return obj.kids.count()
@@ -186,10 +189,12 @@ class GuestDetailSerializer(serializers.ModelSerializer):
     category_name = serializers.CharField(source='category.name', read_only=True)
     kids = KidSerializer(many=True, read_only=True)
     is_checked_in_today = serializers.SerializerMethodField()
+    # Deprecated read-only alias, see GuestSummarySerializer.
+    adult_names = serializers.CharField(source='names', read_only=True)
 
     class Meta:
         model = Guest
-        fields = ('id', 'adult_names', 'spouse_name', 'email', 'phone', 'nanny_name', 'nanny_count', 'allergies', 'category_name', 'kids', 'ticket_number', 'custom_data', 'is_checked_in_today')
+        fields = ('id', 'names', 'adult_names', 'spouse_name', 'email', 'phone', 'nanny_name', 'nanny_count', 'allergies', 'category_name', 'kids', 'ticket_number', 'custom_data', 'is_checked_in_today')
 
     def get_is_checked_in_today(self, obj):
         from django.utils import timezone
@@ -197,7 +202,7 @@ class GuestDetailSerializer(serializers.ModelSerializer):
         return obj.accreditations.filter(date=today, is_accredited=True).exists()
 
 class AccreditationSerializer(serializers.ModelSerializer):
-    guest_name = serializers.CharField(source='guest.adult_names', read_only=True)
+    guest_name = serializers.CharField(source='guest.names', read_only=True)
     category_name = serializers.CharField(source='guest.category.name', read_only=True)
     verified_by_name = serializers.CharField(source='verified_by.full_name', read_only=True, allow_null=True)
     location_name = serializers.CharField(source='location.name', read_only=True, allow_null=True)
@@ -227,7 +232,15 @@ class OrganizerAPIKeyCreateSerializer(serializers.Serializer):
         return value
 
 class OrganizerGuestSerializer(serializers.Serializer):
-    adult_names = serializers.CharField()
+    """
+    One guest row accepted by the bulk-ingest endpoints.
+
+    A row is valid only with a name plus an email or a phone number.
+    `adult_names` is still accepted as a deprecated input alias so existing
+    organizer scripts and spreadsheets keep working.
+    """
+    names = serializers.CharField(required=False, allow_blank=True)
+    adult_names = serializers.CharField(required=False, allow_blank=True, write_only=True)
     email = serializers.EmailField(required=False, allow_blank=True)
     phone = serializers.CharField(required=False, allow_blank=True)
     category_name = serializers.CharField(required=False, allow_blank=True)
@@ -237,3 +250,18 @@ class OrganizerGuestSerializer(serializers.Serializer):
         required=False,
         default=list
     )
+
+    def validate(self, attrs):
+        names = (attrs.get('names') or attrs.get('adult_names') or '').strip()
+        if not names:
+            raise serializers.ValidationError(
+                {'names': 'At least one guest name is required.'}
+            )
+
+        if not (attrs.get('email') or '').strip() and not (attrs.get('phone') or '').strip():
+            raise serializers.ValidationError(
+                {'email': 'Provide an email address or a phone number.'}
+            )
+
+        attrs['names'] = names
+        return attrs

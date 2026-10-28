@@ -191,7 +191,7 @@ Content-Type: application/json
 {
   "guests": [
     {
-      "adult_names": "John Doe",
+      "names": "John Doe",
       "email": "john@example.com",
       "phone": "555-1234",
       "category_name": "VIP",
@@ -206,6 +206,11 @@ Content-Type: application/json
   ]
 }
 ```
+
+Each guest needs a name plus **either** an email **or** a phone number. Rows
+without one of those are rejected and reported in the response `errors` list.
+`adult_names` is still accepted as a deprecated alias for `names` so existing
+integrations keep working, but new integrations should send `names`.
 
 Up to 1000 guests per request — split larger lists into batches. Guests that
 already exist (matching email, or name when no email is given) are not

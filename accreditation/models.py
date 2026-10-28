@@ -7,6 +7,7 @@ import string
 from django.db import models
 from django.contrib.auth.models import AbstractUser, BaseUserManager
 from django.conf import settings
+from django.core.exceptions import ValidationError
 from django.core.files.base import ContentFile
 
 class CustomUserManager(BaseUserManager):
@@ -113,7 +114,7 @@ class UserEventAccess(models.Model):
 class Guest(models.Model):
     event = models.ForeignKey(Event, on_delete=models.CASCADE, related_name='guests')
     category = models.ForeignKey(GuestCategory, on_delete=models.SET_NULL, null=True, blank=True)
-    adult_names = models.TextField()
+    names = models.TextField()
     spouse_name = models.CharField(max_length=255, blank=True)
     email = models.EmailField(blank=True)
     phone = models.CharField(max_length=20, blank=True)
@@ -126,7 +127,29 @@ class Guest(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
 
     def __str__(self):
-        return self.adult_names
+        return self.names
+
+    def clean(self):
+        """
+        A guest is only usable if we can identify and contact them.
+
+        Deliberately enforced here (and at the API/import boundary) rather than
+        as a database CheckConstraint: rows created before this rule existed may
+        already lack both email and phone, and a constraint would make the
+        migration fail on that existing data.
+        """
+        errors = {}
+
+        names = (self.names or '').strip()
+        if not names:
+            errors['names'] = 'At least one guest name is required.'
+
+        if not (self.email or '').strip() and not (self.phone or '').strip():
+            errors['email'] = 'Provide an email address or a phone number.'
+            errors['phone'] = 'Provide a phone number or an email address.'
+
+        if errors:
+            raise ValidationError(errors)
 
     def save(self, *args, **kwargs):
         is_new = self.pk is None # Check if this is a brand new object
@@ -173,7 +196,7 @@ class Guest(models.Model):
     class Meta:
         indexes = [
             models.Index(fields=['event', 'ticket_number']),
-            models.Index(fields=['event', 'adult_names']),
+            models.Index(fields=['event', 'names']),
             models.Index(fields=['email']),
         ]
 
@@ -205,7 +228,7 @@ class Accreditation(models.Model):
         ]
 
     def __str__(self):
-        return f"{self.guest.adult_names} - {self.date}"
+        return f"{self.guest.names} - {self.date}"
 
 def generate_api_key():
     return secrets.token_urlsafe(32)

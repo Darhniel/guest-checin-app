@@ -152,7 +152,7 @@ Guest:
   - id (PK)
   - event: FK(Event)
   - category: FK(GuestCategory, nullable)
-  - adult_names: TextField
+  - names: TextField
   - spouse_name: CharField
   - email: EmailField
   - phone: CharField
@@ -164,6 +164,8 @@ Guest:
   - custom_data: JSONField (Phase 5)
   - created_at: DateTime
 ```
+Rule (enforced in `Guest.clean()` and at every ingest boundary, not as a DB
+constraint): `names` is required, plus **either** `email` **or** `phone`.
 
 #### Kid
 ```

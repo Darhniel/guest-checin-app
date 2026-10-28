@@ -78,7 +78,7 @@ class EventGuestsListView(generics.ListAPIView):
 
     def get_queryset(self):
         event_id = self.kwargs.get('event_id')
-        return Guest.objects.filter(event_id=event_id).order_by('adult_names')
+        return Guest.objects.filter(event_id=event_id).order_by('names')
     
 class EventListView(generics.ListCreateAPIView):
     serializer_class = EventSerializer
@@ -194,7 +194,7 @@ class CheckInView(generics.CreateAPIView):
 
         # 1. Find Guest
         guest = Guest.objects.filter(
-            Q(adult_names__iexact=identifier) | Q(ticket_number__iexact=identifier),
+            Q(names__iexact=identifier) | Q(ticket_number__iexact=identifier),
             event_id=event_id
         ).first()
 
@@ -309,8 +309,8 @@ class SearchGuestsView(generics.ListAPIView):
 
         guests = Guest.objects.filter(
             event_id=event_id,
-            adult_names__icontains=query
-        ).order_by('adult_names')[:10]
+            names__icontains=query
+        ).order_by('names')[:10]
 
         # Annotate with checked-in status for the UI
         for guest in guests:
@@ -541,6 +541,160 @@ class AdminEventAnalyticsView(generics.RetrieveAPIView):
             'by_category': list(by_category),
         })
 
+# Palette used when an admin CSV import introduces a category the event has
+# not configured yet, so imported guests are not silently left uncategorised.
+CATEGORY_COLORS = [
+    '#2563EB', '#7C3AED', '#DB2777', '#EA580C',
+    '#0891B2', '#16A34A', '#CA8A04', '#4F46E5',
+]
+
+
+def ingest_guests(event, guests_data, *, user=None, source='organizer',
+                  actor_label='', create_categories=False):
+    """
+    Shared bulk-guest ingest used by the organizer API and the admin CSV import.
+
+    Deduplicates on email (refreshing the stored name when it changed) and, for
+    guests without an email, on the guest name. Row-level failures are collected
+    instead of aborting the batch. Returns a plain summary dict.
+    """
+    created_count = 0
+    skipped_count = 0
+    errors_list = []
+    created_categories = []
+
+    for idx, raw in enumerate(guests_data):
+        g_data = dict(raw) if isinstance(raw, dict) else {}
+        # `adult_names` is a deprecated alias kept for existing organizer sheets.
+        label = (
+            (g_data.get('names') or g_data.get('adult_names') or '').strip()
+            or f'Row {idx + 1}'
+        )
+        try:
+            if not isinstance(raw, dict):
+                raise ValueError('Guest must be an object')
+
+            # Validate custom_data against the event's schema
+            custom_data = g_data.get('custom_data') or {}
+            if not isinstance(custom_data, dict):
+                raise ValueError('custom_data must be an object')
+            if event.custom_fields_schema:
+                custom_data = validate_custom_data(custom_data, event.custom_fields_schema)
+
+            # Resolve the category, creating it only for admin imports
+            category = None
+            category_name = (g_data.get('category_name') or '').strip()
+            if category_name:
+                category = GuestCategory.objects.filter(
+                    event=event,
+                    name__iexact=category_name,
+                    is_active=True
+                ).first()
+                if category is None and create_categories:
+                    category = GuestCategory.objects.create(
+                        event=event,
+                        name=category_name[:50],
+                        color=CATEGORY_COLORS[
+                            len(created_categories) % len(CATEGORY_COLORS)
+                        ],
+                    )
+                    created_categories.append(category.name)
+
+            kids_data = g_data.get('kids') or []
+            if not isinstance(kids_data, list):
+                raise ValueError('kids must be a list')
+
+            names = (g_data.get('names') or g_data.get('adult_names') or '').strip()
+            if not names:
+                raise ValueError('A guest name is required')
+
+            email = (g_data.get('email') or '').strip()
+            # Phone is capped by the model's max_length; trim noisy input.
+            phone = (g_data.get('phone') or '').strip()[:20]
+
+            # A guest is only identifiable and contactable with a name plus at
+            # least one way to reach them.
+            if not email and not phone:
+                raise ValueError('Provide an email address or a phone number')
+
+            if email:
+                # Deduplicate on email, and refresh the name if changed.
+                guest, created = Guest.objects.get_or_create(
+                    event=event,
+                    email=email,
+                    defaults={
+                        'names': names,
+                        'phone': phone,
+                        'category': category,
+                        'custom_data': custom_data,
+                    }
+                )
+                if not created and names and names != guest.names:
+                    guest.names = names
+                    guest.save(update_fields=['names'])
+            else:
+                # No email: deduplicate on the guest's own name so unique
+                # attendees without an email are not collapsed into one row.
+                guest, created = Guest.objects.get_or_create(
+                    event=event,
+                    names=names,
+                    email='',
+                    defaults={
+                        'phone': phone,
+                        'category': category,
+                        'custom_data': custom_data,
+                    }
+                )
+
+            if created:
+                created_count += 1
+                for k_data in kids_data:
+                    if not isinstance(k_data, dict):
+                        continue
+                    kid_name = (k_data.get('name') or '').strip()
+                    if not kid_name:
+                        continue
+                    try:
+                        kid_age = int(k_data.get('age'))
+                    except (TypeError, ValueError):
+                        continue
+                    Kid.objects.get_or_create(
+                        guest=guest,
+                        defaults={
+                            'name': kid_name,
+                            'age': kid_age,
+                            'gender': str(k_data.get('gender') or '')[:50],
+                        }
+                    )
+
+                AuditLog.objects.create(
+                    user=user,
+                    action='api_guest_create' if source == 'organizer'
+                    else 'admin_guest_import',
+                    resource_type='Guest',
+                    resource_id=guest.id,
+                    details={
+                        'source': source,
+                        **({'organizer': actor_label} if actor_label else {}),
+                    }
+                )
+            else:
+                skipped_count += 1
+        except Exception as e:
+            errors_list.append({
+                'index': idx,
+                'error': str(e),
+                'guest': label,
+            })
+
+    return {
+        'created_count': created_count,
+        'skipped_count': skipped_count,
+        'errors': errors_list,
+        'created_categories': created_categories,
+    }
+
+
 class OrganizerBulkGuestView(generics.CreateAPIView):
     authentication_classes = []
     permission_classes = (OrganizerPermission,)
@@ -549,7 +703,7 @@ class OrganizerBulkGuestView(generics.CreateAPIView):
     def create(self, request, *args, **kwargs):
         event = request.organizer_key.event
         guests_data = request.data.get('guests', [])
-        
+
         if not isinstance(guests_data, list):
             return Response({'error': 'Expected a list of guests'}, status=400)
 
@@ -559,85 +713,68 @@ class OrganizerBulkGuestView(generics.CreateAPIView):
                 status=400
             )
 
-        created_count = 0
-        errors_list = []
-        
-        for idx, g_data in enumerate(guests_data):
-            try:
-                # Validate custom_data against event schema
-                custom_data = g_data.get('custom_data', {})
-                if event.custom_fields_schema:
-                    custom_data = validate_custom_data(custom_data, event.custom_fields_schema)
-                
-                # Find or create category
-                category = None
-                category_name = g_data.get('category_name')
-                if category_name:
-                    category = GuestCategory.objects.filter(
-                        event=event,
-                        name__iexact=category_name,
-                        is_active=True
-                    ).first()
-                
-                # Create guest
-                kids_data = g_data.pop('kids', [])
-                adult_names = (g_data.get('adult_names') or '').strip()
-                if not adult_names:
-                    raise ValueError('adult_names is required')
-                email = (g_data.get('email') or '').strip()
-
-                if email:
-                    # Deduplicate on email, and refresh the name if changed.
-                    guest, created = Guest.objects.get_or_create(
-                        event=event,
-                        email=email,
-                        defaults={
-                            'adult_names': adult_names,
-                            'phone': g_data.get('phone', ''),
-                            'category': category,
-                            'custom_data': custom_data,
-                        }
-                    )
-                    if not created and adult_names and adult_names != guest.adult_names:
-                        guest.adult_names = adult_names
-                        guest.save(update_fields=['adult_names'])
-                else:
-                    # No email: deduplicate on the guest's own name so unique
-                    # attendees without an email are no longer collapsed
-                    # into a single record.
-                    guest, created = Guest.objects.get_or_create(
-                        event=event,
-                        adult_names=adult_names,
-                        email='',
-                        defaults={
-                            'phone': g_data.get('phone', ''),
-                            'category': category,
-                            'custom_data': custom_data,
-                        }
-                    )
-                
-                if created:
-                    created_count += 1
-                    for k_data in kids_data:
-                        Kid.objects.get_or_create(guest=guest, defaults=k_data)
-                        
-                    AuditLog.objects.create(
-                        action='api_guest_create',
-                        resource_type='Guest',
-                        resource_id=guest.id,
-                        details={'organizer': request.organizer_key.organizer_name}
-                    )
-            except Exception as e:
-                errors_list.append({
-                    'index': idx,
-                    'error': str(e),
-                    'guest': g_data.get('adult_names', 'Unknown')
-                })
+        result = ingest_guests(
+            event,
+            guests_data,
+            source='organizer',
+            actor_label=request.organizer_key.organizer_name,
+        )
 
         return Response({
-            'message': f'Processed {len(guests_data)} guests. Created {created_count} new records.',
-            'created_count': created_count,
-            'errors': errors_list if errors_list else None
+            'message': f'Processed {len(guests_data)} guests. Created {result["created_count"]} new records.',
+            'created_count': result['created_count'],
+            'skipped_count': result['skipped_count'],
+            'errors': result['errors'] or None
+        }, status=201)
+
+
+class AdminEventBulkGuestView(generics.CreateAPIView):
+    """
+    Admin guest import used by the dashboard's CSV uploader.
+
+    Accepts the same `{"guests": [...]}` payload as the organizer endpoint but
+    authenticates with the admin's JWT. Unlike the organizer path it creates
+    missing guest categories, so a list exported from the organizer's sheet
+    keeps its ticket types.
+    """
+    permission_classes = (permissions.IsAuthenticated,)
+    serializer_class = OrganizerGuestSerializer
+
+    def create(self, request, *args, **kwargs):
+        if request.user.role != 'admin':
+            return Response({'error': 'Admin only'}, status=403)
+
+        event = Event.objects.filter(id=kwargs.get('event_id')).first()
+        if not event:
+            return Response({'error': 'Event not found.'}, status=404)
+
+        guests_data = request.data.get('guests', [])
+        if not isinstance(guests_data, list) or not guests_data:
+            return Response(
+                {'error': 'Provide a non-empty list of guests.'},
+                status=400
+            )
+
+        if len(guests_data) > 1000:
+            return Response(
+                {'error': 'Send at most 1000 guests per request. Split the list into smaller batches.'},
+                status=400
+            )
+
+        result = ingest_guests(
+            event,
+            guests_data,
+            user=request.user,
+            source='admin',
+            create_categories=True,
+        )
+
+        return Response({
+            'message': f'Processed {len(guests_data)} guests. Created {result["created_count"]} new records.',
+            'created_count': result['created_count'],
+            'skipped_count': result['skipped_count'],
+            'created_categories': result['created_categories'],
+            'errors': result['errors'] or None,
         }, status=201)
 class AdminEventApiKeyListCreateView(generics.ListCreateAPIView):
     """
@@ -980,7 +1117,7 @@ def _event_report(event):
                 'accreditations', filter=Q(accreditations__is_accredited=True)
             )
         )
-        .order_by('adult_names')
+        .order_by('names')
     )
 
     guests = []
@@ -990,7 +1127,10 @@ def _event_report(event):
         guests.append({
             'id': guest.id,
             'ticket_number': guest.ticket_number,
-            'adult_names': guest.adult_names,
+            'names': guest.names,
+            # Deprecated alias kept for dashboard builds deployed before the
+            # rename; safe to drop once every client reads `names`.
+            'adult_names': guest.names,
             'email': guest.email,
             'phone': guest.phone,
             'category': guest.category.name if guest.category else None,
@@ -1015,7 +1155,7 @@ def _event_report(event):
 
     recent_checkins = [
         {
-            'guest_name': row.guest.adult_names,
+            'guest_name': row.guest.names,
             'category': row.guest.category.name if row.guest.category else None,
             'location': row.location.name if row.location else None,
             'ambassador': row.verified_by.full_name if row.verified_by else None,

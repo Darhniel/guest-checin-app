@@ -53,20 +53,20 @@ class UserEventAccessAdmin(admin.ModelAdmin):
 
 @admin.register(Guest)
 class GuestAdmin(admin.ModelAdmin):
-    list_display = ('adult_names', 'event', 'category', 'ticket_number', 'email')
+    list_display = ('names', 'event', 'category', 'ticket_number', 'email')
     list_filter = ('event', 'category')
-    search_fields = ('adult_names', 'ticket_number', 'email')
+    search_fields = ('names', 'ticket_number', 'email')
 
 @admin.register(Kid)
 class KidAdmin(admin.ModelAdmin):
     list_display = ('name', 'age', 'guest')
-    search_fields = ('name', 'guest__adult_names')
+    search_fields = ('name', 'guest__names')
 
 @admin.register(Accreditation)
 class AccreditationAdmin(admin.ModelAdmin):
     list_display = ('guest', 'event', 'verified_by', 'location', 'date', 'time')
     list_filter = ('event', 'date', 'location')
-    search_fields = ('guest__adult_names', 'verified_by__full_name')
+    search_fields = ('guest__names', 'verified_by__full_name')
 
 @admin.register(OrganizerAPIKey)
 class OrganizerAPIKeyAdmin(admin.ModelAdmin):
