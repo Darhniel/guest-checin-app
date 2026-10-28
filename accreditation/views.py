@@ -1,4 +1,5 @@
 from rest_framework import generics, status, permissions, exceptions
+from rest_framework.exceptions import ValidationError as DRFValidationError
 from rest_framework.response import Response
 from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
 from django.contrib.auth import get_user_model
@@ -14,7 +15,7 @@ from .models import (
 from .serializers import (
     UserSerializer, UserCreateSerializer, EventSerializer, 
     LocationSerializer, GuestCategorySerializer, OrganizerGuestSerializer,
-    OrganizerAPIKeySerializer,
+    OrganizerAPIKeySerializer, AdminGuestCreateSerializer,
 )
 from django.utils import timezone
 from django.db.models import Q, Count
@@ -562,6 +563,8 @@ def ingest_guests(event, guests_data, *, user=None, source='organizer',
     skipped_count = 0
     errors_list = []
     created_categories = []
+    created_ids = []
+    duplicates = []
 
     for idx, raw in enumerate(guests_data):
         g_data = dict(raw) if isinstance(raw, dict) else {}
@@ -617,17 +620,32 @@ def ingest_guests(event, guests_data, *, user=None, source='organizer',
             if not email and not phone:
                 raise ValueError('Provide an email address or a phone number')
 
+            # Household details are optional and only sent by the manual form.
+            spouse_name = (g_data.get('spouse_name') or '').strip()[:255]
+            nanny_name = (g_data.get('nanny_name') or '').strip()[:255]
+            allergies = (g_data.get('allergies') or '').strip()
+            try:
+                nanny_count = max(0, int(g_data.get('nanny_count') or 0))
+            except (TypeError, ValueError):
+                raise ValueError('nanny_count must be a whole number')
+
+            defaults = {
+                'phone': phone,
+                'category': category,
+                'custom_data': custom_data,
+                'spouse_name': spouse_name,
+                'nanny_name': nanny_name,
+                'nanny_count': nanny_count,
+                'allergies': allergies,
+            }
+
             if email:
                 # Deduplicate on email, and refresh the name if changed.
+                defaults['names'] = names
                 guest, created = Guest.objects.get_or_create(
                     event=event,
                     email=email,
-                    defaults={
-                        'names': names,
-                        'phone': phone,
-                        'category': category,
-                        'custom_data': custom_data,
-                    }
+                    defaults=defaults
                 )
                 if not created and names and names != guest.names:
                     guest.names = names
@@ -639,15 +657,12 @@ def ingest_guests(event, guests_data, *, user=None, source='organizer',
                     event=event,
                     names=names,
                     email='',
-                    defaults={
-                        'phone': phone,
-                        'category': category,
-                        'custom_data': custom_data,
-                    }
+                    defaults=defaults
                 )
 
             if created:
                 created_count += 1
+                created_ids.append(guest.id)
                 for k_data in kids_data:
                     if not isinstance(k_data, dict):
                         continue
@@ -658,19 +673,20 @@ def ingest_guests(event, guests_data, *, user=None, source='organizer',
                         kid_age = int(k_data.get('age'))
                     except (TypeError, ValueError):
                         continue
-                    Kid.objects.get_or_create(
+                    # The guest is brand new, so each child row is a new kid.
+                    Kid.objects.create(
                         guest=guest,
-                        defaults={
-                            'name': kid_name,
-                            'age': kid_age,
-                            'gender': str(k_data.get('gender') or '')[:50],
-                        }
+                        name=kid_name[:255],
+                        age=kid_age,
+                        gender=str(k_data.get('gender') or '')[:50],
                     )
 
                 AuditLog.objects.create(
                     user=user,
-                    action='api_guest_create' if source == 'organizer'
-                    else 'admin_guest_import',
+                    action={
+                        'organizer': 'api_guest_create',
+                        'admin_manual': 'admin_guest_create',
+                    }.get(source, 'admin_guest_import'),
                     resource_type='Guest',
                     resource_id=guest.id,
                     details={
@@ -680,10 +696,18 @@ def ingest_guests(event, guests_data, *, user=None, source='organizer',
                 )
             else:
                 skipped_count += 1
+                duplicates.append({'index': idx, 'guest_id': guest.id})
         except Exception as e:
             errors_list.append({
                 'index': idx,
-                'error': str(e),
+                # DRF wraps custom-field problems in a nested detail dict;
+                # flatten it so the CSV result reads "Staff_Id is required"
+                # instead of Python dict repr.
+                'error': (
+                    _first_validation_message(e.detail, prefix_fields=False)
+                    if isinstance(e, DRFValidationError)
+                    else str(e)
+                ),
                 'guest': label,
             })
 
@@ -692,6 +716,8 @@ def ingest_guests(event, guests_data, *, user=None, source='organizer',
         'skipped_count': skipped_count,
         'errors': errors_list,
         'created_categories': created_categories,
+        'created_ids': created_ids,
+        'duplicates': duplicates,
     }
 
 
@@ -776,6 +802,109 @@ class AdminEventBulkGuestView(generics.CreateAPIView):
             'created_categories': result['created_categories'],
             'errors': result['errors'] or None,
         }, status=201)
+
+
+def _first_validation_message(errors, *, prefix_fields=True):
+    """Flatten DRF's nested error structure into one readable sentence."""
+    if isinstance(errors, dict):
+        for field, value in errors.items():
+            message = _first_validation_message(
+                value, prefix_fields=prefix_fields
+            )
+            if message:
+                if field in ('non_field_errors', 'detail'):
+                    return message
+                # Nested list errors use integer keys; the field message alone
+                # reads better than "0: ...".
+                if isinstance(field, int) or not prefix_fields:
+                    return message
+                return f'{str(field).replace("_", " ").capitalize()}: {message}'
+    elif isinstance(errors, (list, tuple)):
+        for value in errors:
+            message = _first_validation_message(
+                value, prefix_fields=prefix_fields
+            )
+            if message:
+                return message
+    elif isinstance(errors, str):
+        return errors
+    return ''
+
+
+class AdminEventGuestCreateView(generics.CreateAPIView):
+    """
+    Add one guest by hand from the dashboard.
+
+    Shares the bulk importer's validation and category rules so a manually
+    added guest behaves exactly like an imported one, but reports problems
+    (and duplicates) as a single readable error for the form.
+    """
+    permission_classes = (permissions.IsAuthenticated,)
+    serializer_class = AdminGuestCreateSerializer
+
+    def create(self, request, *args, **kwargs):
+        if request.user.role != 'admin':
+            return Response({'error': 'Admin only'}, status=403)
+
+        event = Event.objects.filter(id=kwargs.get('event_id')).first()
+        if not event:
+            return Response({'error': 'Event not found.'}, status=404)
+
+        serializer = self.get_serializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(
+                {'error': _first_validation_message(serializer.errors)},
+                status=400
+            )
+
+        data = serializer.validated_data
+        result = ingest_guests(
+            event,
+            [data],
+            user=request.user,
+            source='admin_manual',
+            create_categories=True,
+        )
+
+        if result['errors']:
+            return Response(
+                {'error': result['errors'][0]['error']},
+                status=400
+            )
+
+        if not result['created_ids']:
+            if data.get('email'):
+                message = (
+                    'A guest with this email address is already on this '
+                    'event. Edit that guest instead, or use a different '
+                    'email address.'
+                )
+            else:
+                message = (
+                    'A guest with this name (and no email) is already on '
+                    'this event. Add an email address to tell them apart.'
+                )
+            payload = {'error': message}
+            if result['duplicates']:
+                payload['existing_guest_id'] = result['duplicates'][0]['guest_id']
+            return Response(payload, status=409)
+
+        guest = (
+            Guest.objects
+            .select_related('category')
+            .prefetch_related('kids')
+            .filter(id=result['created_ids'][0])
+            .first()
+        )
+        return Response(
+            {
+                'message': 'Guest added.',
+                **GuestDetailSerializer(guest).data,
+            },
+            status=status.HTTP_201_CREATED,
+        )
+
+
 class AdminEventApiKeyListCreateView(generics.ListCreateAPIView):
     """
     Organizer API keys for one event (admin only).

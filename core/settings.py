@@ -6,9 +6,14 @@ import sentry_sdk
 from sentry_sdk.integrations.django import DjangoIntegration
 from dotenv import load_dotenv
 
-load_dotenv()
-
 BASE_DIR = Path(__file__).resolve().parent.parent
+
+# Base configuration first, then local-only overrides. `.env.local` is
+# gitignored and does not exist on the server, so production stays defined by
+# `.env` alone while a developer can point the same checkout at a local
+# database/port without editing shared values.
+load_dotenv(BASE_DIR / '.env')
+load_dotenv(BASE_DIR / '.env.local', override=True)
 
 SENTRY_DSN = os.environ.get('SENTRY_DSN')
 
@@ -22,6 +27,15 @@ ALLOWED_HOSTS = [
     for host in os.environ.get('ALLOWED_HOSTS', 'localhost,127.0.0.1').split(',')
     if host.strip()
 ]
+
+if DEBUG:
+    # A dev server is reached as localhost from the dashboard and as the LAN IP
+    # from the Expo app, and that IP changes with the network. Django rejects
+    # unknown hosts with a bare HTML 400 before any view runs, which looks like
+    # a broken endpoint. Never applied when DEBUG is off.
+    for _local_host in ('localhost', '127.0.0.1', '[::1]'):
+        if _local_host not in ALLOWED_HOSTS:
+            ALLOWED_HOSTS.append(_local_host)
 
 INSTALLED_APPS = [
     'django.contrib.admin',
@@ -72,10 +86,13 @@ TEMPLATES = [
 
 WSGI_APPLICATION = 'core.wsgi.application'
 
+# DATABASE_URL decides the database: Postgres in production, SQLite when it is
+# unset or points at a file. `.env.local` overrides it for local runs, so the
+# production URL in `.env` stays untouched.
 DATABASES = {
     'default': dj_database_url.config(
-        default=os.environ.get('DATABASE_URL', f'sqlite:///{BASE_DIR / "db.sqlite3"}'),
-        conn_max_age=600
+        default=f"sqlite:///{(BASE_DIR / 'db.sqlite3').as_posix()}",
+        conn_max_age=600,
     )
 }
 
@@ -164,9 +181,16 @@ SECURE_HSTS_PRELOAD = True
 SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
 
 if not DEBUG:
-    SECURE_SSL_REDIRECT = True
     SESSION_COOKIE_SECURE = True
     CSRF_COOKIE_SECURE = True
+
+# On by default whenever DEBUG is off, but overridable so a local stack that
+# stays in production mode can still be served over plain HTTP. Without this,
+# every API call gets a 301 to https://localhost:8000, which no browser can
+# reach and which surfaces as a failed request in the dashboard.
+SECURE_SSL_REDIRECT = os.environ.get(
+    'SECURE_SSL_REDIRECT', str(not DEBUG)
+).strip().lower() in ('1', 'true', 'yes', 'on')
 
 CACHES = {
     'default': {

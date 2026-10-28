@@ -35,6 +35,7 @@ urlpatterns = [
     path('admin/ambassadors/<int:pk>/', views.AdminAmbassadorDetailView.as_view(), name='admin_ambassador_detail'),
     path('admin/ambassadors/<int:pk>/toggle/', views.AdminAmbassadorToggleView.as_view(), name='admin_ambassador_toggle'),
     path('admin/events/<int:event_id>/assign-bulk/', views.AdminEventAssignBulkView.as_view(), name='admin_event_assign_bulk'),
+    path('admin/events/<int:event_id>/guests/', views.AdminEventGuestCreateView.as_view(), name='admin_event_guest_create'),
     path('admin/events/<int:event_id>/guests/bulk/', views.AdminEventBulkGuestView.as_view(), name='admin_event_bulk_guests'),
     path('admin/events/<int:event_id>/analytics/', views.AdminEventAnalyticsView.as_view(), name='admin_event_analytics'),
     path('admin/reports/', views.AdminReportsListView.as_view(), name='admin_reports'),

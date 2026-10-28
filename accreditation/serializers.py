@@ -265,3 +265,51 @@ class OrganizerGuestSerializer(serializers.Serializer):
 
         attrs['names'] = names
         return attrs
+
+class AdminGuestKidSerializer(serializers.Serializer):
+    """One child submitted alongside a manually entered guest."""
+
+    name = serializers.CharField(max_length=255)
+    age = serializers.IntegerField(min_value=0, max_value=120)
+    gender = serializers.CharField(required=False, allow_blank=True, max_length=50)
+
+class AdminGuestCreateSerializer(serializers.Serializer):
+    """
+    One guest submitted from the dashboard's manual entry form.
+
+    Mirrors the bulk-ingest rules (a name plus an email or a phone number) but
+    validates eagerly so the form can show a field-specific message instead of
+    a row-level import error.
+    """
+
+    names = serializers.CharField(allow_blank=True)
+    email = serializers.EmailField(required=False, allow_blank=True)
+    phone = serializers.CharField(required=False, allow_blank=True, max_length=20)
+    category_name = serializers.CharField(required=False, allow_blank=True, max_length=50)
+    spouse_name = serializers.CharField(required=False, allow_blank=True, max_length=255)
+    nanny_name = serializers.CharField(required=False, allow_blank=True, max_length=255)
+    nanny_count = serializers.IntegerField(required=False, min_value=0, default=0)
+    allergies = serializers.CharField(required=False, allow_blank=True)
+    custom_data = serializers.DictField(required=False, default=dict)
+    kids = AdminGuestKidSerializer(many=True, required=False, default=list)
+
+    def validate_names(self, value):
+        value = value.strip()
+        if not value:
+            raise serializers.ValidationError(
+                'At least one guest name is required.'
+            )
+        return value
+
+    def validate(self, attrs):
+        email = (attrs.get('email') or '').strip()
+        phone = (attrs.get('phone') or '').strip()
+
+        if not email and not phone:
+            raise serializers.ValidationError(
+                {'email': 'Provide an email address or a phone number.'}
+            )
+
+        attrs['email'] = email
+        attrs['phone'] = phone
+        return attrs
