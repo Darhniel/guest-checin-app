@@ -12,19 +12,19 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # gitignored and does not exist on the server, so production stays defined by
 # `.env` alone while a developer can point the same checkout at a local
 # database/port without editing shared values.
-load_dotenv(BASE_DIR / '.env')
-load_dotenv(BASE_DIR / '.env.local', override=True)
+load_dotenv(BASE_DIR / ".env")
+load_dotenv(BASE_DIR / ".env.local", override=True)
 
-SENTRY_DSN = os.environ.get('SENTRY_DSN')
+SENTRY_DSN = os.environ.get("SENTRY_DSN")
 
 # Required in production (Django refuses to boot with an empty SECRET_KEY) —
 # set it in the service environment, never commit it.
-SECRET_KEY = os.environ.get('DJANGO_SECRET_KEY')
+SECRET_KEY = os.environ.get("DJANGO_SECRET_KEY")
 # Production-safe default: set DEBUG=True locally only when needed.
-DEBUG = os.environ.get('DEBUG', 'False') == 'True'
+DEBUG = os.environ.get("DEBUG", "False") == "True"
 ALLOWED_HOSTS = [
     host.strip()
-    for host in os.environ.get('ALLOWED_HOSTS', 'localhost,127.0.0.1').split(',')
+    for host in os.environ.get("ALLOWED_HOSTS", "localhost,127.0.0.1").split(",")
     if host.strip()
 ]
 
@@ -33,131 +33,129 @@ if DEBUG:
     # from the Expo app, and that IP changes with the network. Django rejects
     # unknown hosts with a bare HTML 400 before any view runs, which looks like
     # a broken endpoint. Never applied when DEBUG is off.
-    for _local_host in ('localhost', '127.0.0.1', '[::1]'):
+    for _local_host in ("localhost", "127.0.0.1", "[::1]"):
         if _local_host not in ALLOWED_HOSTS:
             ALLOWED_HOSTS.append(_local_host)
 
 INSTALLED_APPS = [
-    'django.contrib.admin',
-    'django.contrib.auth',
-    'django.contrib.contenttypes',
-    'django.contrib.sessions',
-    'django.contrib.messages',
-    'django.contrib.staticfiles',
-    
+    "django.contrib.admin",
+    "django.contrib.auth",
+    "django.contrib.contenttypes",
+    "django.contrib.sessions",
+    "django.contrib.messages",
+    "django.contrib.staticfiles",
     # Third party
-    'rest_framework',
-    'rest_framework_simplejwt',
-    'corsheaders',
-    
+    "rest_framework",
+    "rest_framework_simplejwt",
+    "corsheaders",
     # Local
-    'accreditation',
+    "accreditation",
 ]
 
 MIDDLEWARE = [
-    'corsheaders.middleware.CorsMiddleware', # Must be at the top
-    'django.middleware.security.SecurityMiddleware',
-    'whitenoise.middleware.WhiteNoiseMiddleware',
-    'django.contrib.sessions.middleware.SessionMiddleware',
-    'django.middleware.common.CommonMiddleware',
-    'django.middleware.csrf.CsrfViewMiddleware',
-    'django.contrib.auth.middleware.AuthenticationMiddleware',
-    'django.contrib.messages.middleware.MessageMiddleware',
-    'django.middleware.clickjacking.XFrameOptionsMiddleware',
+    "corsheaders.middleware.CorsMiddleware",  # Must be at the top
+    "django.middleware.security.SecurityMiddleware",
+    "whitenoise.middleware.WhiteNoiseMiddleware",
+    "django.contrib.sessions.middleware.SessionMiddleware",
+    "django.middleware.common.CommonMiddleware",
+    "django.middleware.csrf.CsrfViewMiddleware",
+    "django.contrib.auth.middleware.AuthenticationMiddleware",
+    "django.contrib.messages.middleware.MessageMiddleware",
+    "django.middleware.clickjacking.XFrameOptionsMiddleware",
 ]
 
-ROOT_URLCONF = 'core.urls'
+ROOT_URLCONF = "core.urls"
 
 TEMPLATES = [
     {
-        'BACKEND': 'django.template.backends.django.DjangoTemplates',
-        'DIRS': [],
-        'APP_DIRS': True,
-        'OPTIONS': {
-            'context_processors': [
-                'django.template.context_processors.debug',
-                'django.template.context_processors.request',
-                'django.contrib.auth.context_processors.auth',
-                'django.contrib.messages.context_processors.messages',
+        "BACKEND": "django.template.backends.django.DjangoTemplates",
+        "DIRS": [],
+        "APP_DIRS": True,
+        "OPTIONS": {
+            "context_processors": [
+                "django.template.context_processors.debug",
+                "django.template.context_processors.request",
+                "django.contrib.auth.context_processors.auth",
+                "django.contrib.messages.context_processors.messages",
             ],
         },
     },
 ]
 
-WSGI_APPLICATION = 'core.wsgi.application'
+WSGI_APPLICATION = "core.wsgi.application"
 
 # DATABASE_URL decides the database: Postgres in production, SQLite when it is
 # unset or points at a file. `.env.local` overrides it for local runs, so the
 # production URL in `.env` stays untouched.
 DATABASES = {
-    'default': dj_database_url.config(
+    "default": dj_database_url.config(
         default=f"sqlite:///{(BASE_DIR / 'db.sqlite3').as_posix()}",
         conn_max_age=600,
     )
 }
 
 AUTH_PASSWORD_VALIDATORS = [
-    {'NAME': 'django.contrib.auth.password_validation.UserAttributeSimilarityValidator'},
-    {'NAME': 'django.contrib.auth.password_validation.MinimumLengthValidator'},
-    {'NAME': 'django.contrib.auth.password_validation.CommonPasswordValidator'},
-    {'NAME': 'django.contrib.auth.password_validation.NumericPasswordValidator'},
+    {
+        "NAME": "django.contrib.auth.password_validation.UserAttributeSimilarityValidator"
+    },
+    {"NAME": "django.contrib.auth.password_validation.MinimumLengthValidator"},
+    {"NAME": "django.contrib.auth.password_validation.CommonPasswordValidator"},
+    {"NAME": "django.contrib.auth.password_validation.NumericPasswordValidator"},
 ]
 
-LANGUAGE_CODE = 'en-us'
-TIME_ZONE = 'Africa/Lagos'
+LANGUAGE_CODE = "en-us"
+TIME_ZONE = "Africa/Lagos"
 USE_I18N = True
 USE_TZ = True
 
-STATIC_URL = 'static/'
-STATIC_ROOT = BASE_DIR / 'staticfiles'
+STATIC_URL = "static/"
+STATIC_ROOT = BASE_DIR / "staticfiles"
 
 # Django 5.1+ replaced STATICFILES_STORAGE with STORAGES. Keep the compressed,
 # fingerprinted files WhiteNoise is designed to serve. Run collectstatic first.
 STORAGES = {
-    'default': {'BACKEND': 'django.core.files.storage.FileSystemStorage'},
-    'staticfiles': {
-        'BACKEND': 'whitenoise.storage.CompressedManifestStaticFilesStorage'
+    "default": {"BACKEND": "django.core.files.storage.FileSystemStorage"},
+    "staticfiles": {
+        "BACKEND": "whitenoise.storage.CompressedManifestStaticFilesStorage"
     },
 }
 
-MEDIA_URL = '/media/'
-MEDIA_ROOT = BASE_DIR / 'media'
+MEDIA_URL = "/media/"
+MEDIA_ROOT = BASE_DIR / "media"
 
-DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
+DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 # Custom User Model
-AUTH_USER_MODEL = 'accreditation.CustomUser'
+AUTH_USER_MODEL = "accreditation.CustomUser"
 
 # REST Framework Settings
 REST_FRAMEWORK = {
-    'DEFAULT_AUTHENTICATION_CLASSES': (
-        'rest_framework_simplejwt.authentication.JWTAuthentication',
+    "DEFAULT_AUTHENTICATION_CLASSES": (
+        "rest_framework_simplejwt.authentication.JWTAuthentication",
     ),
-    'DEFAULT_PERMISSION_CLASSES': (
-        'rest_framework.permissions.IsAuthenticated',
-    ),
-    'DEFAULT_THROTTLE_RATES': {
-        'login': '5/minute',  # Matches the 'scope' in LoginThrottle
+    "DEFAULT_PERMISSION_CLASSES": ("rest_framework.permissions.IsAuthenticated",),
+    "DEFAULT_THROTTLE_RATES": {
+        "login": "5/minute",  # Matches the 'scope' in LoginThrottle
         # 'anon': '100/hour', # Optional: general anonymous API limit
-    }
+    },
 }
 
 # CORS Settings
 CORS_ALLOW_ALL_ORIGINS = DEBUG
 CORS_ALLOWED_ORIGINS = [
-    "http://localhost:8081", # Expo dev
-    "http://localhost:3000", # Next.js dev
+    "http://localhost:8081",  # Expo dev
+    "http://localhost:3000",  # Next.js dev
     "https://dashboard.accredit.vip",
 ]
 
 # Simple JWT — without this block the library defaults to 5-minute access
 # tokens, which silently logs dashboard users out mid-session.
 SIMPLE_JWT = {
-    'ACCESS_TOKEN_LIFETIME': timedelta(minutes=60),
-    'REFRESH_TOKEN_LIFETIME': timedelta(days=7),
-    'ROTATE_REFRESH_TOKENS': True,
-    'BLACKLIST_AFTER_ROTATION': False,
-    'AUTH_HEADER_TYPES': ('Bearer',),
+    "ACCESS_TOKEN_LIFETIME": timedelta(minutes=60),
+    "REFRESH_TOKEN_LIFETIME": timedelta(days=7),
+    "ROTATE_REFRESH_TOKENS": True,
+    "BLACKLIST_AFTER_ROTATION": False,
+    "AUTH_HEADER_TYPES": ("Bearer",),
 }
 
 
@@ -169,16 +167,16 @@ if SENTRY_DSN:
         profile_session_sample_rate=1.0,
         profile_lifecycle="trace",
         send_default_pii=False,  # Don't send personal data
-        environment=os.environ.get('ENVIRONMENT', 'development'),
+        environment=os.environ.get("ENVIRONMENT", "development"),
     )
 
 SECURE_BROWSER_XSS_FILTER = True
 SECURE_CONTENT_TYPE_NOSNIFF = True
-X_FRAME_OPTIONS = 'DENY'
+X_FRAME_OPTIONS = "DENY"
 SECURE_HSTS_SECONDS = 31536000 if not DEBUG else 0
 SECURE_HSTS_INCLUDE_SUBDOMAINS = True
 SECURE_HSTS_PRELOAD = True
-SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
+SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
 
 if not DEBUG:
     SESSION_COOKIE_SECURE = True
@@ -189,13 +187,13 @@ if not DEBUG:
 # every API call gets a 301 to https://localhost:8000, which no browser can
 # reach and which surfaces as a failed request in the dashboard.
 SECURE_SSL_REDIRECT = os.environ.get(
-    'SECURE_SSL_REDIRECT', str(not DEBUG)
-).strip().lower() in ('1', 'true', 'yes', 'on')
+    "SECURE_SSL_REDIRECT", str(not DEBUG)
+).strip().lower() in ("1", "true", "yes", "on")
 
 CACHES = {
-    'default': {
-        'BACKEND': 'django.core.cache.backends.locmem.LocMemCache',
-        'LOCATION': 'unique-snowflake',
+    "default": {
+        "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
+        "LOCATION": "unique-snowflake",
     }
 }
 
