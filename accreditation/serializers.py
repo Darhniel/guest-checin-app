@@ -1,10 +1,77 @@
+import base64
+import binascii
 from django.db import transaction
 from django.views import generic
+from django.core.files.base import ContentFile
 from rest_framework import serializers
 from django.contrib.auth import get_user_model
-from .models import Accreditation, Event, Guest, Kid, Location, GuestCategory, OrganizerAPIKey, UserEventAccess
+from .models import (
+    Accreditation,
+    Event,
+    Guest,
+    Location,
+    GuestCategory,
+    OrganizerAPIKey,
+    UserEventAccess,
+    split_guest_name,
+)
 
 User = get_user_model()
+
+# Event flyers are sent from the dashboard as base64 data URLs inside the JSON
+# event payload. Keep the same 5 MB ceiling the upload UI advertises.
+FLYER_MAX_BYTES = 5 * 1024 * 1024
+FLYER_MIME_EXTENSIONS = {
+    'image/png': '.png',
+    'image/jpeg': '.jpg',
+    'image/webp': '.webp',
+    'image/gif': '.gif',
+}
+
+
+class Base64ImageField(serializers.ImageField):
+    """ImageField that also accepts a ``data:<mime>;base64,<payload>`` string.
+
+    The dashboard keeps the whole event (including nested locations and
+    categories) in one JSON request, so the flyer cannot be a multipart part.
+    Decoding the data URL here keeps that single-request flow while still
+    storing a real image file on the model.
+    """
+
+    def to_internal_value(self, data):
+        if isinstance(data, str) and data.startswith('data:'):
+            try:
+                header, payload = data.split(',', 1)
+                metadata = header[5:]
+            except ValueError:
+                raise serializers.ValidationError('Invalid flyer data.')
+
+            mime_type = metadata.split(';', 1)[0].strip().lower()
+            if ';base64' not in metadata.lower():
+                raise serializers.ValidationError(
+                    'Flyer must be base64-encoded.'
+                )
+            if mime_type not in FLYER_MIME_EXTENSIONS:
+                raise serializers.ValidationError(
+                    'Upload a PNG, JPG, WebP, or GIF image.'
+                )
+
+            try:
+                decoded = base64.b64decode(payload, validate=True)
+            except (binascii.Error, ValueError):
+                raise serializers.ValidationError('Invalid flyer data.')
+
+            if len(decoded) > FLYER_MAX_BYTES:
+                raise serializers.ValidationError(
+                    'Flyer must be 5 MB or smaller.'
+                )
+
+            data = ContentFile(
+                decoded,
+                name=f'flyer{FLYER_MIME_EXTENSIONS[mime_type]}',
+            )
+
+        return super().to_internal_value(data)
 
 class ActiveListSerializer(serializers.ListSerializer):
     """Only expose active rows while still supporting nested writes."""
@@ -63,11 +130,12 @@ class EventSerializer(serializers.ModelSerializer):
     categories = GuestCategorySerializer(many=True, required=False)
     created_by = UserSerializer(read_only=True)
     ambassadors = serializers.SerializerMethodField()
+    flyer = Base64ImageField(required=False, allow_null=True)
 
     class Meta:
         model = Event
         fields = (
-            'id', 'name', 'description', 'logo', 'location_text', 
+            'id', 'name', 'description', 'logo', 'flyer', 'location_text', 
             'start_date', 'end_date', 'daily_schedule', 'custom_fields_schema',
             'enforce_hours', 'is_active',
             'created_by', 'created_at', 'locations', 'categories', 'ambassadors'
@@ -157,28 +225,20 @@ class EventSerializer(serializers.ModelSerializer):
 
         return instance
 
-class KidSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = Kid
-        fields = ('id', 'name', 'age', 'gender')
-
 # 🛡️ PRIVACY RULE: Ambassadors only see this
 class GuestSummarySerializer(serializers.ModelSerializer):
     category_name = serializers.CharField(source='category.name', read_only=True)
     category_color = serializers.CharField(source='category.color', read_only=True)
-    kids_count = serializers.SerializerMethodField()
     is_checked_in_today = serializers.SerializerMethodField()
-    # Deprecated read-only alias so already-installed mobile clients keep
-    # working while they move from `adult_names` to `names`.
+    # Full name is derived from first_name/last_name but still emitted as
+    # `names` so installed mobile clients and the dashboard keep working.
+    names = serializers.CharField(read_only=True)
     adult_names = serializers.CharField(source='names', read_only=True)
 
     class Meta:
         model = Guest
-        fields = ('id', 'names', 'adult_names', 'category_name', 'category_color', 'kids_count', 'is_checked_in_today', 'ticket_number')
+        fields = ('id', 'names', 'first_name', 'last_name', 'adult_names', 'category_name', 'category_color', 'is_checked_in_today', 'ticket_number')
 
-    def get_kids_count(self, obj):  # ✅ FIXED: Use method instead of source
-        return obj.kids.count()
-    
     def get_is_checked_in_today(self, obj):
         from django.utils import timezone
         today = timezone.localdate()
@@ -187,14 +247,16 @@ class GuestSummarySerializer(serializers.ModelSerializer):
 # 🛡️ PRIVACY RULE: Admins see this
 class GuestDetailSerializer(serializers.ModelSerializer):
     category_name = serializers.CharField(source='category.name', read_only=True)
-    kids = KidSerializer(many=True, read_only=True)
     is_checked_in_today = serializers.SerializerMethodField()
-    # Deprecated read-only alias, see GuestSummarySerializer.
+    names = serializers.CharField(read_only=True)
     adult_names = serializers.CharField(source='names', read_only=True)
+    # `phone` is kept as a read-only alias for clients built before the
+    # phone_number rename.
+    phone = serializers.CharField(source='phone_number', read_only=True)
 
     class Meta:
         model = Guest
-        fields = ('id', 'names', 'adult_names', 'spouse_name', 'email', 'phone', 'nanny_name', 'nanny_count', 'allergies', 'category_name', 'kids', 'ticket_number', 'custom_data', 'is_checked_in_today')
+        fields = ('id', 'names', 'first_name', 'last_name', 'adult_names', 'email', 'phone', 'phone_number', 'category_name', 'ticket_number', 'custom_data', 'is_checked_in_today')
 
     def get_is_checked_in_today(self, obj):
         from django.utils import timezone
@@ -206,14 +268,10 @@ class AccreditationSerializer(serializers.ModelSerializer):
     category_name = serializers.CharField(source='guest.category.name', read_only=True)
     verified_by_name = serializers.CharField(source='verified_by.full_name', read_only=True, allow_null=True)
     location_name = serializers.CharField(source='location.name', read_only=True, allow_null=True)
-    kids_count = serializers.SerializerMethodField()
 
     class Meta:
         model = Accreditation
-        fields = ('id', 'guest_name', 'category_name', 'verified_by_name', 'location_name', 'date', 'time', 'is_accredited', 'kids_count')
-
-    def get_kids_count(self, obj):  # ✅ FIXED
-        return obj.guest.kids.count() if obj.guest else 0
+        fields = ('id', 'guest_name', 'category_name', 'verified_by_name', 'location_name', 'date', 'time', 'is_accredited')
 
 class OrganizerAPIKeySerializer(serializers.ModelSerializer):
     """Masked representation — the raw key is never returned here."""
@@ -235,81 +293,87 @@ class OrganizerGuestSerializer(serializers.Serializer):
     """
     One guest row accepted by the bulk-ingest endpoints.
 
-    A row is valid only with a name plus an email or a phone number.
-    `adult_names` is still accepted as a deprecated input alias so existing
-    organizer scripts and spreadsheets keep working.
+    `first_name` and `last_name` are required; email and phone are optional.
+    `names` / `adult_names` remain accepted as deprecated single-field aliases
+    for older organizer sheets and are split into a first and last name.
     """
-    names = serializers.CharField(required=False, allow_blank=True)
+    first_name = serializers.CharField(required=False, allow_blank=True, max_length=255)
+    last_name = serializers.CharField(required=False, allow_blank=True, max_length=255)
+    names = serializers.CharField(required=False, allow_blank=True, write_only=True)
     adult_names = serializers.CharField(required=False, allow_blank=True, write_only=True)
     email = serializers.EmailField(required=False, allow_blank=True)
-    phone = serializers.CharField(required=False, allow_blank=True)
+    phone = serializers.CharField(required=False, allow_blank=True, max_length=20)
+    phone_number = serializers.CharField(required=False, allow_blank=True, max_length=20)
     category_name = serializers.CharField(required=False, allow_blank=True)
     custom_data = serializers.DictField(required=False, default=dict)
-    kids = serializers.ListField(
-        child=serializers.DictField(),
-        required=False,
-        default=list
-    )
 
     def validate(self, attrs):
-        names = (attrs.get('names') or attrs.get('adult_names') or '').strip()
-        if not names:
-            raise serializers.ValidationError(
-                {'names': 'At least one guest name is required.'}
-            )
+        first_name = (attrs.get('first_name') or '').strip()
+        last_name = (attrs.get('last_name') or '').strip()
+        legacy_name = (attrs.get('names') or attrs.get('adult_names') or '').strip()
 
-        if not (attrs.get('email') or '').strip() and not (attrs.get('phone') or '').strip():
-            raise serializers.ValidationError(
-                {'email': 'Provide an email address or a phone number.'}
-            )
+        if not first_name and not last_name and legacy_name:
+            first_name, last_name = split_guest_name(legacy_name)
 
-        attrs['names'] = names
+        errors = {}
+        if not first_name:
+            errors['first_name'] = 'A first name is required.'
+        # A legacy single-field name may be a mononym such as "Prince"; new
+        # payloads must send both name columns.
+        if not last_name and not legacy_name:
+            errors['last_name'] = 'A last name is required.'
+        if errors:
+            raise serializers.ValidationError(errors)
+
+        attrs['first_name'] = first_name
+        attrs['last_name'] = last_name
+        attrs['phone_number'] = (
+            attrs.get('phone_number') or attrs.get('phone') or ''
+        ).strip()
+        attrs.pop('names', None)
+        attrs.pop('adult_names', None)
         return attrs
-
-class AdminGuestKidSerializer(serializers.Serializer):
-    """One child submitted alongside a manually entered guest."""
-
-    name = serializers.CharField(max_length=255)
-    age = serializers.IntegerField(min_value=0, max_value=120)
-    gender = serializers.CharField(required=False, allow_blank=True, max_length=50)
 
 class AdminGuestCreateSerializer(serializers.Serializer):
     """
     One guest submitted from the dashboard's manual entry form.
 
-    Mirrors the bulk-ingest rules (a name plus an email or a phone number) but
-    validates eagerly so the form can show a field-specific message instead of
-    a row-level import error.
+    First and last name are required; email and phone number are optional.
+    The dashboard still submits a single `names` field, which is split into
+    the two columns for backward compatibility.
     """
 
-    names = serializers.CharField(allow_blank=True)
+    first_name = serializers.CharField(required=False, allow_blank=True, max_length=255)
+    last_name = serializers.CharField(required=False, allow_blank=True, max_length=255)
+    names = serializers.CharField(required=False, allow_blank=True)
     email = serializers.EmailField(required=False, allow_blank=True)
     phone = serializers.CharField(required=False, allow_blank=True, max_length=20)
+    phone_number = serializers.CharField(required=False, allow_blank=True, max_length=20)
     category_name = serializers.CharField(required=False, allow_blank=True, max_length=50)
-    spouse_name = serializers.CharField(required=False, allow_blank=True, max_length=255)
-    nanny_name = serializers.CharField(required=False, allow_blank=True, max_length=255)
-    nanny_count = serializers.IntegerField(required=False, min_value=0, default=0)
-    allergies = serializers.CharField(required=False, allow_blank=True)
     custom_data = serializers.DictField(required=False, default=dict)
-    kids = AdminGuestKidSerializer(many=True, required=False, default=list)
-
-    def validate_names(self, value):
-        value = value.strip()
-        if not value:
-            raise serializers.ValidationError(
-                'At least one guest name is required.'
-            )
-        return value
 
     def validate(self, attrs):
-        email = (attrs.get('email') or '').strip()
-        phone = (attrs.get('phone') or '').strip()
+        first_name = (attrs.get('first_name') or '').strip()
+        last_name = (attrs.get('last_name') or '').strip()
+        legacy_name = (attrs.get('names') or '').strip()
 
-        if not email and not phone:
-            raise serializers.ValidationError(
-                {'email': 'Provide an email address or a phone number.'}
-            )
+        if not first_name and not last_name and legacy_name:
+            first_name, last_name = split_guest_name(legacy_name)
 
-        attrs['email'] = email
-        attrs['phone'] = phone
+        errors = {}
+        if not first_name:
+            errors['first_name'] = 'A first name is required.'
+        # A legacy single-field name such as "Prince" is accepted as-is; the
+        # split just leaves the last name empty.
+        if not last_name and not legacy_name:
+            errors['last_name'] = 'A last name is required.'
+        if errors:
+            raise serializers.ValidationError(errors)
+
+        attrs['first_name'] = first_name
+        attrs['last_name'] = last_name
+        attrs['email'] = (attrs.get('email') or '').strip()
+        attrs['phone_number'] = (
+            attrs.get('phone_number') or attrs.get('phone') or ''
+        ).strip()[:20]
         return attrs

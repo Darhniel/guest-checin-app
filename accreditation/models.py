@@ -56,6 +56,7 @@ class Event(models.Model):
     name = models.CharField(max_length=255)
     description = models.TextField(blank=True)
     logo = models.ImageField(upload_to='event_logos/', blank=True, null=True)
+    flyer = models.ImageField(upload_to='event_flyers/', blank=True, null=True, help_text='Event flyer/poster used for report theming')
     location_text = models.CharField(max_length=255, blank=True, help_text="General location, e.g., 'Lagos, Nigeria'")
     start_date = models.DateField()
     end_date = models.DateField()
@@ -111,42 +112,45 @@ class UserEventAccess(models.Model):
 # NEW PHASE 2 MODELS
 # ==========================================
 
+def split_guest_name(value):
+    """Split a free-text name into a ``(first_name, last_name)`` pair."""
+    parts = (value or '').strip().split(None, 1)
+    return (parts[0] if parts else '', parts[1] if len(parts) > 1 else '')
+
+
 class Guest(models.Model):
     event = models.ForeignKey(Event, on_delete=models.CASCADE, related_name='guests')
     category = models.ForeignKey(GuestCategory, on_delete=models.SET_NULL, null=True, blank=True)
-    names = models.TextField()
-    spouse_name = models.CharField(max_length=255, blank=True)
+    first_name = models.CharField(max_length=255)
+    last_name = models.CharField(max_length=255)
     email = models.EmailField(blank=True)
-    phone = models.CharField(max_length=20, blank=True)
-    nanny_name = models.CharField(max_length=255, blank=True)
-    nanny_count = models.IntegerField(default=0)
-    allergies = models.TextField(blank=True)
+    phone_number = models.CharField(max_length=20, blank=True)
     ticket_number = models.CharField(max_length=32, unique=True, blank=True, editable=False)
     qr_code = models.ImageField(upload_to='qr_codes/', blank=True, null=True)
     custom_data = models.JSONField(default=dict, blank=True) # For Phase 5 custom fields
     created_at = models.DateTimeField(auto_now_add=True)
+
+    @property
+    def names(self):
+        """Full display name, kept so existing clients can read `names`."""
+        return f'{self.first_name} {self.last_name}'.strip()
 
     def __str__(self):
         return self.names
 
     def clean(self):
         """
-        A guest is only usable if we can identify and contact them.
+        First and last name are the only required guest fields.
 
-        Deliberately enforced here (and at the API/import boundary) rather than
-        as a database CheckConstraint: rows created before this rule existed may
-        already lack both email and phone, and a constraint would make the
-        migration fail on that existing data.
+        Email and phone number are optional, so the API and dashboard can both
+        accept a guest without contact details.
         """
         errors = {}
 
-        names = (self.names or '').strip()
-        if not names:
-            errors['names'] = 'At least one guest name is required.'
-
-        if not (self.email or '').strip() and not (self.phone or '').strip():
-            errors['email'] = 'Provide an email address or a phone number.'
-            errors['phone'] = 'Provide a phone number or an email address.'
+        if not (self.first_name or '').strip():
+            errors['first_name'] = 'A first name is required.'
+        if not (self.last_name or '').strip():
+            errors['last_name'] = 'A last name is required.'
 
         if errors:
             raise ValidationError(errors)
@@ -196,18 +200,9 @@ class Guest(models.Model):
     class Meta:
         indexes = [
             models.Index(fields=['event', 'ticket_number']),
-            models.Index(fields=['event', 'names']),
+            models.Index(fields=['event', 'first_name', 'last_name']),
             models.Index(fields=['email']),
         ]
-
-class Kid(models.Model):
-    guest = models.ForeignKey(Guest, on_delete=models.CASCADE, related_name='kids')
-    name = models.CharField(max_length=255)
-    age = models.IntegerField()
-    gender = models.CharField(max_length=50, blank=True)
-
-    def __str__(self):
-        return f"{self.name} ({self.age})"
 
 class Accreditation(models.Model):
     guest = models.ForeignKey(Guest, on_delete=models.CASCADE, related_name='accreditations')

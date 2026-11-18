@@ -152,30 +152,19 @@ Guest:
   - id (PK)
   - event: FK(Event)
   - category: FK(GuestCategory, nullable)
-  - names: TextField
-  - spouse_name: CharField
+  - first_name: CharField
+  - last_name: CharField
   - email: EmailField
-  - phone: CharField
-  - nanny_name: CharField
-  - nanny_count: Integer
-  - allergies: TextField
+  - phone_number: CharField
   - ticket_number: CharField (unique, auto-generated)
   - qr_code: ImageField
   - custom_data: JSONField (Phase 5)
   - created_at: DateTime
 ```
 Rule (enforced in `Guest.clean()` and at every ingest boundary, not as a DB
-constraint): `names` is required, plus **either** `email` **or** `phone`.
-
-#### Kid
-```
-Kid:
-  - id (PK)
-  - guest: FK(Guest)
-  - name: CharField
-  - age: Integer
-  - gender: CharField
-```
+constraint): `first_name` and `last_name` are required; `email` and
+`phone_number` are optional. `Guest.names` is a computed display name, and
+`names` / `adult_names` remain accepted as legacy input aliases.
 
 #### Accreditation
 ```
@@ -383,10 +372,10 @@ Admin creates ambassador account
 | View analytics | ✅ | ❌ | ❌ |
 
 ### Data Privacy
-- **Ambassadors see:** name, category, kids count, check-in status
-- **Admins see:** everything (email, phone, spouse, nanny, custom fields)
+- **Ambassadors see:** name, category, check-in status
+- **Admins see:** everything (email, phone, custom fields)
 - **Organizer API sees:** only what they push (their own guests)
-- **Google Sheets:** limited columns (name, category, kids, verified by, time)
+- **Google Sheets:** limited columns (name, category, verified by, time)
 
 ### Access Control
 - **Need-to-know events:** Ambassador sees ONLY events they're assigned to
@@ -548,8 +537,7 @@ FRONTEND_URL
 ### Phase 2: Core Check-In (Week 3-4)
 **Goal:** Working check-in flow for ambassadors
 
-- Guest model (core fields only)
-- Kid model
+- Guest model
 - Accreditation model with UNIQUE constraint
 - Organizer API key model
 - Organizer API endpoints (bulk guest upload)

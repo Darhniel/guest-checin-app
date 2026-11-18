@@ -18,7 +18,7 @@ This guide provides strict rules, constraints, and step-by-step instructions for
 
 ### Rule 1: Security First
 - **NEVER** store passwords in plain text — always use Django's built-in hashing
-- **NEVER** expose sensitive guest data (email, phone, spouse) to ambassadors — use role-based serializers
+- **NEVER** expose sensitive guest data (email, phone) to ambassadors - use role-based serializers
 - **NEVER** allow ambassadors to access events they're not assigned to — enforce UserEventAccess checks
 - **NEVER** disable the UNIQUE constraint on Accreditation (guest, date) — this prevents double check-ins
 - **NEVER** commit environment variables or API keys to GitHub
@@ -38,8 +38,8 @@ This guide provides strict rules, constraints, and step-by-step instructions for
 - **ALWAYS** use appropriate serializer (GuestSummarySerializer vs GuestDetailSerializer)
 
 ### Rule 4: Data Privacy
-- **Ambassadors see:** name, category, kids_count, check-in status ONLY
-- **Admins see:** everything (email, phone, spouse, nanny, custom fields)
+- **Ambassadors see:** name, category, check-in status ONLY
+- **Admins see:** everything (email, phone, custom fields)
 - **NEVER** return full guest data to ambassadors — even if they "need it"
 - **ALWAYS** log data access in AuditLog for compliance
 
@@ -187,7 +187,6 @@ web-dashboard/
 
 #### Backend Tasks
 - [ ] Create Guest model (core fields)
-- [ ] Create Kid model
 - [ ] Create Accreditation model with UNIQUE constraint
 - [ ] Create OrganizerAPIKey model
 - [ ] Create GuestSummarySerializer (limited fields)
@@ -427,7 +426,7 @@ test('admin sees full guest data');
 ## 🐛 Common Pitfalls & Solutions
 
 ### Pitfall 1: Ambassador sees full guest data
-**Problem:** Ambassador can see email, phone, spouse info
+**Problem:** Ambassador can see email, phone
 **Solution:** Check `request.user.role` in view, use GuestSummarySerializer for ambassadors
 
 ### Pitfall 2: Offline check-in allows duplicates

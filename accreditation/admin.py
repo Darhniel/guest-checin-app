@@ -1,6 +1,6 @@
 from django.contrib import admin
 from django.contrib.auth.admin import UserAdmin
-from .models import Accreditation, CustomUser, Event, Guest, Kid, Location, GuestCategory, OrganizerAPIKey, UserEventAccess
+from .models import Accreditation, CustomUser, Event, Guest, Location, GuestCategory, OrganizerAPIKey, UserEventAccess
 
 
 
@@ -53,20 +53,15 @@ class UserEventAccessAdmin(admin.ModelAdmin):
 
 @admin.register(Guest)
 class GuestAdmin(admin.ModelAdmin):
-    list_display = ('names', 'event', 'category', 'ticket_number', 'email')
+    list_display = ('first_name', 'last_name', 'event', 'category', 'ticket_number', 'email')
     list_filter = ('event', 'category')
-    search_fields = ('names', 'ticket_number', 'email')
-
-@admin.register(Kid)
-class KidAdmin(admin.ModelAdmin):
-    list_display = ('name', 'age', 'guest')
-    search_fields = ('name', 'guest__names')
+    search_fields = ('first_name', 'last_name', 'ticket_number', 'email')
 
 @admin.register(Accreditation)
 class AccreditationAdmin(admin.ModelAdmin):
     list_display = ('guest', 'event', 'verified_by', 'location', 'date', 'time')
     list_filter = ('event', 'date', 'location')
-    search_fields = ('guest__names', 'verified_by__full_name')
+    search_fields = ('guest__first_name', 'guest__last_name', 'verified_by__full_name')
 
 @admin.register(OrganizerAPIKey)
 class OrganizerAPIKeyAdmin(admin.ModelAdmin):

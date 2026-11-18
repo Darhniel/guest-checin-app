@@ -123,6 +123,11 @@ STORAGES = {
 MEDIA_URL = "/media/"
 MEDIA_ROOT = BASE_DIR / "media"
 
+# Event flyers travel as base64 inside the JSON event payload. A 5 MB image
+# becomes ~6.7 MB once encoded, which is above Django's 2.5 MB default request
+# cap. Allow enough headroom for the image plus the rest of the event body.
+DATA_UPLOAD_MAX_MEMORY_SIZE = 12 * 1024 * 1024
+
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 # Custom User Model

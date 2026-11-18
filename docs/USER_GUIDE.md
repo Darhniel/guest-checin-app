@@ -183,38 +183,61 @@ new one. Keys are limited to 90 requests per minute.
 
 ### Pushing Guest Lists
 
+Send `first_name` and `last_name` for every guest. `email` and `phone` are
+optional. Custom fields are sent in `custom_data` and must match the event's
+configured schema.
+
+**Single record:**
+
 ```bash
 POST /api/organizers/events/{event_id}/guests/bulk/
 Authorization: Bearer YOUR_API_KEY
 Content-Type: application/json
 
 {
-  "guests": [
-    {
-      "names": "John Doe",
-      "email": "john@example.com",
-      "phone": "555-1234",
-      "category_name": "VIP",
-      "custom_data": {
-        "company": "Acme Corp",
-        "dietary": "Vegetarian"
-      },
-      "kids": [
-        {"name": "Timmy", "age": 5, "gender": "Male"}
-      ]
-    }
-  ]
+  "first_name": "Josh",
+  "last_name": "Dune",
+  "email": "josh.dune@example.com",
+  "phone": "07062682727"
 }
 ```
 
-Each guest needs a name plus **either** an email **or** a phone number. Rows
-without one of those are rejected and reported in the response `errors` list.
-`adult_names` is still accepted as a deprecated alias for `names` so existing
-integrations keep working, but new integrations should send `names`.
+**Multiple records** (a bare JSON array):
+
+```json
+[
+  {"first_name": "Jude", "last_name": "Doe", "email": "jude.doe@example.com", "phone": "1234567890"},
+  {"first_name": "June", "last_name": "Smith", "email": "june.smith@example.com", "phone": "0987654321"},
+  {"first_name": "July", "last_name": "Loop", "email": "july.loop@example.com", "phone": "0987654321"}
+]
+```
+
+**Optional extra fields** (`category_name`, `custom_data`) can be added to any
+record:
+
+```json
+{
+  "first_name": "John",
+  "last_name": "Doe",
+  "email": "john@example.com",
+  "phone": "555-1234",
+  "category_name": "VIP",
+  "custom_data": {
+    "company": "Acme Corp",
+    "dietary": "Vegetarian"
+  }
+}
+```
+
+`first_name` and `last_name` are required; rows missing either are reported in
+the response `errors` list. The older `{"guests": [...]}` wrapper and the
+single `names` / `adult_names` field are still accepted for existing
+integrations, where a full name is split into first and last name. New
+integrations should send `first_name` and `last_name`.
 
 Up to 1000 guests per request — split larger lists into batches. Guests that
-already exist (matching email, or name when no email is given) are not
-duplicated; the response reports how many new records were created.
+already exist (matching email, or first + last name when no email is given) are
+not duplicated; the response reports how many new records were created.
 
 ### Troubleshooting
 

@@ -11,6 +11,7 @@ from .models import (
     Location,
     GuestCategory,
     UserEventAccess,
+    split_guest_name,
 )
 from .serializers import (
     UserSerializer, UserCreateSerializer, EventSerializer, 
@@ -23,9 +24,11 @@ from django.db.models.functions import TruncHour
 from django.core.cache import cache
 import hashlib
 from rest_framework.permissions import AllowAny
-from .models import Guest, Kid, Accreditation, OrganizerAPIKey, AuditLog
+from .models import Guest, Accreditation, OrganizerAPIKey, AuditLog
 from .serializers import GuestSummarySerializer, GuestDetailSerializer, AccreditationSerializer
+import base64
 import logging
+import mimetypes
 from datetime import datetime, time, timedelta
 from rest_framework.views import APIView
 from .validators import validate_custom_data
@@ -79,7 +82,7 @@ class EventGuestsListView(generics.ListAPIView):
 
     def get_queryset(self):
         event_id = self.kwargs.get('event_id')
-        return Guest.objects.filter(event_id=event_id).order_by('names')
+        return Guest.objects.filter(event_id=event_id).order_by('first_name', 'last_name')
     
 class EventListView(generics.ListCreateAPIView):
     serializer_class = EventSerializer
@@ -193,9 +196,19 @@ class CheckInView(generics.CreateAPIView):
         if not identifier:
             return Response({'status': 400, 'message': 'Please provide ticket number or name'}, status=400)
 
-        # 1. Find Guest
+        # 1. Find Guest by ticket number or by (first and last) name
+        name_parts = identifier.split(None, 1)
+        name_query = Q(first_name__iexact=identifier) | Q(
+            last_name__iexact=identifier
+        )
+        if len(name_parts) > 1:
+            name_query |= Q(
+                first_name__iexact=name_parts[0],
+                last_name__iexact=name_parts[1],
+            )
+
         guest = Guest.objects.filter(
-            Q(names__iexact=identifier) | Q(ticket_number__iexact=identifier),
+            Q(ticket_number__iexact=identifier) | name_query,
             event_id=event_id
         ).first()
 
@@ -308,10 +321,17 @@ class SearchGuestsView(generics.ListAPIView):
             .values_list('guest_id', flat=True)
         )
 
+        # Every term must match a name part, so "john doe" still finds
+        # John Doe while single-word searches match either column.
+        name_query = Q()
+        for term in query.split():
+            name_query &= (
+                Q(first_name__icontains=term) | Q(last_name__icontains=term)
+            )
+
         guests = Guest.objects.filter(
             event_id=event_id,
-            names__icontains=query
-        ).order_by('names')[:10]
+        ).filter(name_query).order_by('first_name', 'last_name')[:10]
 
         # Annotate with checked-in status for the UI
         for guest in guests:
@@ -568,9 +588,17 @@ def ingest_guests(event, guests_data, *, user=None, source='organizer',
 
     for idx, raw in enumerate(guests_data):
         g_data = dict(raw) if isinstance(raw, dict) else {}
-        # `adult_names` is a deprecated alias kept for existing organizer sheets.
+        legacy_name = (
+            g_data.get('names') or g_data.get('adult_names') or ''
+        ).strip()
         label = (
-            (g_data.get('names') or g_data.get('adult_names') or '').strip()
+            ' '.join(
+                part for part in (
+                    (g_data.get('first_name') or '').strip(),
+                    (g_data.get('last_name') or '').strip(),
+                ) if part
+            )
+            or legacy_name
             or f'Row {idx + 1}'
         )
         try:
@@ -603,59 +631,57 @@ def ingest_guests(event, guests_data, *, user=None, source='organizer',
                     )
                     created_categories.append(category.name)
 
-            kids_data = g_data.get('kids') or []
-            if not isinstance(kids_data, list):
-                raise ValueError('kids must be a list')
+            first_name = (g_data.get('first_name') or '').strip()[:255]
+            last_name = (g_data.get('last_name') or '').strip()[:255]
+            # Older organizer sheets and the dashboard's manual form send one
+            # free-text name; split it only when the two columns are absent.
+            if not first_name and not last_name and legacy_name:
+                first_name, last_name = split_guest_name(legacy_name)
 
-            names = (g_data.get('names') or g_data.get('adult_names') or '').strip()
-            if not names:
-                raise ValueError('A guest name is required')
+            if not first_name:
+                raise ValueError('A first name is required')
+            # A legacy single-field name may be a mononym; new payloads must
+            # send both name columns.
+            if not last_name and not legacy_name:
+                raise ValueError('A last name is required')
 
             email = (g_data.get('email') or '').strip()
             # Phone is capped by the model's max_length; trim noisy input.
-            phone = (g_data.get('phone') or '').strip()[:20]
+            phone_number = (
+                g_data.get('phone_number') or g_data.get('phone') or ''
+            ).strip()[:20]
 
-            # A guest is only identifiable and contactable with a name plus at
-            # least one way to reach them.
-            if not email and not phone:
-                raise ValueError('Provide an email address or a phone number')
-
-            # Household details are optional and only sent by the manual form.
-            spouse_name = (g_data.get('spouse_name') or '').strip()[:255]
-            nanny_name = (g_data.get('nanny_name') or '').strip()[:255]
-            allergies = (g_data.get('allergies') or '').strip()
-            try:
-                nanny_count = max(0, int(g_data.get('nanny_count') or 0))
-            except (TypeError, ValueError):
-                raise ValueError('nanny_count must be a whole number')
-
+            # Household fields were removed from the Guest model; old payloads
+            # that still send them are accepted and ignored.
             defaults = {
-                'phone': phone,
+                'first_name': first_name,
+                'last_name': last_name,
+                'phone_number': phone_number,
                 'category': category,
                 'custom_data': custom_data,
-                'spouse_name': spouse_name,
-                'nanny_name': nanny_name,
-                'nanny_count': nanny_count,
-                'allergies': allergies,
             }
 
             if email:
                 # Deduplicate on email, and refresh the name if changed.
-                defaults['names'] = names
                 guest, created = Guest.objects.get_or_create(
                     event=event,
                     email=email,
                     defaults=defaults
                 )
-                if not created and names and names != guest.names:
-                    guest.names = names
-                    guest.save(update_fields=['names'])
+                if not created and (
+                    guest.first_name != first_name
+                    or guest.last_name != last_name
+                ):
+                    guest.first_name = first_name
+                    guest.last_name = last_name
+                    guest.save(update_fields=['first_name', 'last_name'])
             else:
                 # No email: deduplicate on the guest's own name so unique
                 # attendees without an email are not collapsed into one row.
                 guest, created = Guest.objects.get_or_create(
                     event=event,
-                    names=names,
+                    first_name=first_name,
+                    last_name=last_name,
                     email='',
                     defaults=defaults
                 )
@@ -663,23 +689,6 @@ def ingest_guests(event, guests_data, *, user=None, source='organizer',
             if created:
                 created_count += 1
                 created_ids.append(guest.id)
-                for k_data in kids_data:
-                    if not isinstance(k_data, dict):
-                        continue
-                    kid_name = (k_data.get('name') or '').strip()
-                    if not kid_name:
-                        continue
-                    try:
-                        kid_age = int(k_data.get('age'))
-                    except (TypeError, ValueError):
-                        continue
-                    # The guest is brand new, so each child row is a new kid.
-                    Kid.objects.create(
-                        guest=guest,
-                        name=kid_name[:255],
-                        age=kid_age,
-                        gender=str(k_data.get('gender') or '')[:50],
-                    )
 
                 AuditLog.objects.create(
                     user=user,
@@ -728,10 +737,23 @@ class OrganizerBulkGuestView(generics.CreateAPIView):
 
     def create(self, request, *args, **kwargs):
         event = request.organizer_key.event
-        guests_data = request.data.get('guests', [])
+        payload = request.data
+
+        # Accept the shapes organizers actually send:
+        #   {"first_name": ..., "last_name": ...}          (single record)
+        #   [{...}, {...}]                                (multiple records)
+        #   {"guests": [{...}, {...}]}                    (legacy wrapper)
+        if isinstance(payload, dict) and 'guests' in payload:
+            guests_data = payload.get('guests')
+        elif isinstance(payload, list):
+            guests_data = payload
+        elif isinstance(payload, dict):
+            guests_data = [payload]
+        else:
+            guests_data = payload
 
         if not isinstance(guests_data, list):
-            return Response({'error': 'Expected a list of guests'}, status=400)
+            return Response({'error': 'Expected a guest object or a list of guests'}, status=400)
 
         if len(guests_data) > 1000:
             return Response(
@@ -892,7 +914,6 @@ class AdminEventGuestCreateView(generics.CreateAPIView):
         guest = (
             Guest.objects
             .select_related('category')
-            .prefetch_related('kids')
             .filter(id=result['created_ids'][0])
             .first()
         )
@@ -1138,6 +1159,27 @@ def _hour_range(event, observed_hours=None):
     return start_hour, end_hour
 
 
+def _image_file_data_url(image_field):
+    """Return a stored image file as a base64 data URL.
+
+    The dashboard embeds this directly in the downloadable single-file report,
+    so the exported HTML has no dependency on the API or media server.
+    """
+    if not image_field:
+        return None
+
+    try:
+        mime_type = (
+            mimetypes.guess_type(image_field.name)[0] or 'image/jpeg'
+        )
+        with image_field.open('rb') as handle:
+            payload = handle.read()
+        encoded = base64.b64encode(payload).decode('ascii')
+        return f'data:{mime_type};base64,{encoded}'
+    except (FileNotFoundError, OSError, ValueError):
+        return None
+
+
 def _event_report(event):
     """Full report payload for a single event, including the guest list."""
     accreditations = Accreditation.objects.filter(event=event, is_accredited=True)
@@ -1240,13 +1282,12 @@ def _event_report(event):
     guest_queryset = (
         Guest.objects.filter(event=event)
         .select_related('category')
-        .prefetch_related('kids')
         .annotate(
             checkin_count=Count(
                 'accreditations', filter=Q(accreditations__is_accredited=True)
             )
         )
-        .order_by('names')
+        .order_by('first_name', 'last_name')
     )
 
     guests = []
@@ -1256,15 +1297,17 @@ def _event_report(event):
         guests.append({
             'id': guest.id,
             'ticket_number': guest.ticket_number,
+            'first_name': guest.first_name,
+            'last_name': guest.last_name,
+            # Full name is derived on the model; `names`/`adult_names` stay for
+            # dashboard builds that predate the first/last split.
             'names': guest.names,
-            # Deprecated alias kept for dashboard builds deployed before the
-            # rename; safe to drop once every client reads `names`.
             'adult_names': guest.names,
             'email': guest.email,
-            'phone': guest.phone,
+            'phone': guest.phone_number,
+            'phone_number': guest.phone_number,
             'category': guest.category.name if guest.category else None,
             'category_color': guest.category.color if guest.category else None,
-            'kids_count': len(guest.kids.all()),
             'custom_data': guest.custom_data or {},
             'checked_in': guest.checkin_count > 0,
             'checkins': guest.checkin_count,
@@ -1300,6 +1343,7 @@ def _event_report(event):
 
     return {
         'event': EventSerializer(event).data,
+        'flyer_data': _image_file_data_url(event.flyer),
         'generated_at': timezone.now().isoformat(),
         'summary': summary_payload,
         'daily': summary['daily'],
