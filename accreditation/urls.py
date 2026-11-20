@@ -12,6 +12,10 @@ urlpatterns = [
     path('admin/ambassadors/', views.AmbassadorCreateView.as_view(), name='ambassador_create'),
     path('admin/events/<int:event_id>/assign/', views.AssignAmbassadorView.as_view(), name='assign_ambassador'),
 
+    # Admin: Console user management (admins + view-only supervisors)
+    path('admin/admins/', views.AdminUserListView.as_view(), name='admin_user_list'),
+    path('admin/admins/<int:pk>/', views.AdminUserDetailView.as_view(), name='admin_user_detail'),
+
     # Events
     path('events/', views.EventListView.as_view(), name='event_list'),
     path('events/<int:pk>/', views.EventDetailView.as_view(), name='event_detail'),

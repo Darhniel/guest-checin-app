@@ -33,9 +33,13 @@ class CustomUserManager(BaseUserManager):
         return self.create_user(email, password, **extra_fields)
 
 class CustomUser(AbstractUser):
+    ROLE_ADMIN = 'admin'
+    ROLE_SUPERVISOR = 'supervisor'
+    ROLE_AMBASSADOR = 'ambassador'
     ROLE_CHOICES = (
-        ('admin', 'Admin'),
-        ('ambassador', 'Brand Ambassador'),
+        (ROLE_ADMIN, 'Admin'),
+        (ROLE_SUPERVISOR, 'Supervisor (view-only)'),
+        (ROLE_AMBASSADOR, 'Brand Ambassador'),
     )
     username = None # We will use email as the username
     email = models.EmailField(unique=True)
@@ -48,6 +52,20 @@ class CustomUser(AbstractUser):
     REQUIRED_FIELDS = ['full_name']
 
     objects = CustomUserManager()
+
+    @property
+    def is_admin(self):
+        """Full admins can create and change records."""
+        return self.role == self.ROLE_ADMIN
+
+    @property
+    def is_supervisor(self):
+        """Supervisors have read-only access to the admin console."""
+        return self.role == self.ROLE_SUPERVISOR
+
+    @property
+    def can_view_admin_console(self):
+        return self.role in (self.ROLE_ADMIN, self.ROLE_SUPERVISOR)
 
     def __str__(self):
         return self.full_name or self.email

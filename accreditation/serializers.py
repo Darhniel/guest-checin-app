@@ -85,8 +85,8 @@ class ActiveListSerializer(serializers.ListSerializer):
 class UserSerializer(serializers.ModelSerializer):
     class Meta:
         model = User
-        fields = ('id', 'email', 'full_name', 'phone', 'role', 'first_login', 'is_active')
-        read_only_fields = ('id', 'first_login')
+        fields = ('id', 'email', 'full_name', 'phone', 'role', 'first_login', 'is_active', 'date_joined')
+        read_only_fields = ('id', 'first_login', 'date_joined')
 
 class UserCreateSerializer(serializers.ModelSerializer):
     password = serializers.CharField(write_only=True, required=True, style={'input_type': 'password'})
@@ -107,6 +107,35 @@ class UserCreateSerializer(serializers.ModelSerializer):
             first_login=True
         )
         return user
+
+class AdminCreateSerializer(serializers.ModelSerializer):
+    """Create an admin or a view-only supervisor.
+
+    The role is intentionally limited so this endpoint can never be used to
+    mint ambassadors (or anything else) by accident.
+    """
+
+    password = serializers.CharField(write_only=True, required=True, style={'input_type': 'password'})
+    full_name = serializers.CharField(required=True)
+    email = serializers.EmailField(required=True)
+    role = serializers.ChoiceField(
+        choices=(User.ROLE_ADMIN, User.ROLE_SUPERVISOR),
+        default=User.ROLE_SUPERVISOR,
+    )
+
+    class Meta:
+        model = User
+        fields = ('email', 'full_name', 'phone', 'password', 'role')
+
+    def create(self, validated_data):
+        return User.objects.create_user(
+            email=validated_data['email'],
+            full_name=validated_data['full_name'],
+            phone=validated_data.get('phone', ''),
+            password=validated_data['password'],
+            role=validated_data.get('role', User.ROLE_SUPERVISOR),
+            first_login=True,
+        )
 
 class LocationSerializer(serializers.ModelSerializer):
     id = serializers.IntegerField(required=False)

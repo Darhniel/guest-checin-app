@@ -14,7 +14,7 @@ from .models import (
     split_guest_name,
 )
 from .serializers import (
-    UserSerializer, UserCreateSerializer, EventSerializer, 
+    UserSerializer, UserCreateSerializer, AdminCreateSerializer, EventSerializer,
     LocationSerializer, GuestCategorySerializer, OrganizerGuestSerializer,
     OrganizerAPIKeySerializer, AdminGuestCreateSerializer,
 )
@@ -37,6 +37,15 @@ from .throttles import LoginThrottle
 logger = logging.getLogger(__name__)
 
 User = get_user_model()
+
+
+def _is_full_admin(user):
+    return getattr(user, 'role', None) == 'admin'
+
+
+def _can_view_admin_console(user):
+    """Admins and view-only supervisors may read dashboard data."""
+    return getattr(user, 'role', None) in ('admin', 'supervisor')
 
 class CustomTokenObtainPairView(TokenObtainPairView):
     throttle_classes = [LoginThrottle]
@@ -94,9 +103,17 @@ class EventListView(generics.ListCreateAPIView):
             'locations', 'categories'
         )
 
-        if user.role == 'admin':
+        if user.role in ('admin', 'supervisor'):
             return queryset.order_by('-start_date')
         return queryset.filter(user_access__user=user).order_by('-start_date')
+
+    def create(self, request, *args, **kwargs):
+        if not _is_full_admin(request.user):
+            return Response(
+                {'error': 'Only full admins can create events.'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        return super().create(request, *args, **kwargs)
 
     def perform_create(self, serializer):
         serializer.save(created_by=self.request.user)
@@ -108,9 +125,25 @@ class EventDetailView(generics.RetrieveUpdateDestroyAPIView):
 
     def get_queryset(self):
         user = self.request.user
-        if user.role == 'admin':
+        if user.role in ('admin', 'supervisor'):
             return Event.objects.all()
         return Event.objects.filter(user_access__user=user)
+
+    def update(self, request, *args, **kwargs):
+        if not _is_full_admin(request.user):
+            return Response(
+                {'error': 'Only full admins can edit events.'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        return super().update(request, *args, **kwargs)
+
+    def destroy(self, request, *args, **kwargs):
+        if not _is_full_admin(request.user):
+            return Response(
+                {'error': 'Only full admins can delete events.'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        return super().destroy(request, *args, **kwargs)
 
 class LocationListView(generics.ListCreateAPIView):
     serializer_class = LocationSerializer
@@ -121,6 +154,10 @@ class LocationListView(generics.ListCreateAPIView):
         return Location.objects.filter(event_id=event_id, is_active=True).order_by('order')
 
     def perform_create(self, serializer):
+        if not _is_full_admin(self.request.user):
+            raise exceptions.PermissionDenied(
+                'Only full admins can create event locations.'
+            )
         event_id = self.kwargs.get('event_id')
         serializer.save(event_id=event_id)
 
@@ -135,6 +172,10 @@ class CategoryListView(generics.ListCreateAPIView):
         ).order_by('-priority')
 
     def perform_create(self, serializer):
+        if not _is_full_admin(self.request.user):
+            raise exceptions.PermissionDenied(
+                'Only full admins can create guest categories.'
+            )
         event_id = self.kwargs.get('event_id')
         serializer.save(event_id=event_id)
 
@@ -143,12 +184,12 @@ class AmbassadorCreateView(generics.CreateAPIView):
     permission_classes = (permissions.IsAuthenticated,)
 
     def create(self, request, *args, **kwargs):
-        if request.user.role != 'admin':
+        if not _is_full_admin(request.user):
             return Response({'error': 'Permission denied.'}, status=status.HTTP_403_FORBIDDEN)
         
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        user = serializer.save()
+        user = serializer.save(role='ambassador')
         
         # TODO: Phase 2 - Send welcome email with temp password here
         
@@ -162,7 +203,7 @@ class AssignAmbassadorView(generics.CreateAPIView):
     permission_classes = (permissions.IsAuthenticated,)
 
     def create(self, request, *args, **kwargs):
-        if request.user.role != 'admin':
+        if not _is_full_admin(request.user):
             return Response({'error': 'Permission denied.'}, status=status.HTTP_403_FORBIDDEN)
         
         user_id = request.data.get('user_id')
@@ -189,6 +230,12 @@ class CheckInView(generics.CreateAPIView):
     permission_classes = (permissions.IsAuthenticated,)
 
     def create(self, request, *args, **kwargs):
+        if request.user.role == 'supervisor':
+            return Response(
+                {'error': 'Supervisors have view-only access.'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
         event_id = kwargs.get('event_id')
         identifier = request.data.get('identifier', '').strip()
         location_id = request.data.get('location_id')
@@ -399,7 +446,7 @@ class AdminDashboardStatsView(generics.RetrieveAPIView):
     permission_classes = (permissions.IsAuthenticated,)
 
     def get(self, request, *args, **kwargs):
-        if request.user.role != 'admin':
+        if not _can_view_admin_console(request.user):
             return Response({'error': 'Admin only'}, status=403)
 
         today = timezone.localdate()
@@ -425,15 +472,75 @@ class AdminDashboardStatsView(generics.RetrieveAPIView):
 
 
 class AdminAmbassadorListView(generics.ListAPIView):
-    """List all ambassadors (admin only)"""
+    """List all ambassadors (admin and supervisor read access)"""
     from .serializers import UserSerializer
     serializer_class = UserSerializer
     permission_classes = (permissions.IsAuthenticated,)
 
     def get_queryset(self):
-        if self.request.user.role != 'admin':
+        if not _can_view_admin_console(self.request.user):
             return CustomUser.objects.none()
         return CustomUser.objects.filter(role='ambassador').order_by('-date_joined')
+
+
+class AdminUserListView(generics.ListCreateAPIView):
+    """List admins/supervisors and create new console users (full admins only)."""
+
+    permission_classes = (permissions.IsAuthenticated,)
+
+    def get_serializer_class(self):
+        if self.request.method == 'POST':
+            return AdminCreateSerializer
+        return UserSerializer
+
+    def get_queryset(self):
+        if not _is_full_admin(self.request.user):
+            return CustomUser.objects.none()
+        return CustomUser.objects.filter(
+            role__in=(CustomUser.ROLE_ADMIN, CustomUser.ROLE_SUPERVISOR)
+        ).order_by('-date_joined')
+
+    def create(self, request, *args, **kwargs):
+        if not _is_full_admin(request.user):
+            return Response(
+                {'error': 'Only full admins can add console users.'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        user = serializer.save()
+
+        return Response({
+            'message': 'Admin user created successfully.',
+            'user': UserSerializer(user).data,
+        }, status=status.HTTP_201_CREATED)
+
+
+class AdminUserDetailView(generics.RetrieveUpdateDestroyAPIView):
+    """Retrieve, update or delete an admin/supervisor (full admins only)."""
+    serializer_class = UserSerializer
+    permission_classes = (permissions.IsAuthenticated,)
+
+    def get_queryset(self):
+        if not _is_full_admin(self.request.user):
+            return CustomUser.objects.none()
+        return CustomUser.objects.filter(
+            role__in=(CustomUser.ROLE_ADMIN, CustomUser.ROLE_SUPERVISOR)
+        )
+
+    def destroy(self, request, *args, **kwargs):
+        if not _is_full_admin(request.user):
+            return Response({'error': 'Admin only'}, status=403)
+        user = self.get_object()
+        if user.id == request.user.id:
+            return Response(
+                {'error': 'You cannot delete yourself.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        label = user.full_name or user.email
+        user.delete()
+        return Response({'message': f'{label} was deleted.'}, status=status.HTTP_200_OK)
 
 
 class AdminAmbassadorToggleView(generics.UpdateAPIView):
@@ -442,7 +549,7 @@ class AdminAmbassadorToggleView(generics.UpdateAPIView):
     queryset = CustomUser.objects.filter(role='ambassador')
 
     def update(self, request, *args, **kwargs):
-        if request.user.role != 'admin':
+        if not _is_full_admin(request.user):
             return Response({'error': 'Admin only'}, status=403)
         
         user = self.get_object()
@@ -460,11 +567,13 @@ class AdminAmbassadorDetailView(generics.RetrieveUpdateDestroyAPIView):
     permission_classes = (permissions.IsAuthenticated,)
 
     def get_queryset(self):
-        if self.request.user.role != 'admin':
+        if not _is_full_admin(self.request.user):
             return CustomUser.objects.none()
         return CustomUser.objects.filter(role='ambassador')
 
     def destroy(self, request, *args, **kwargs):
+        if not _is_full_admin(request.user):
+            return Response({'error': 'Admin only'}, status=403)
         user = self.get_object()
         label = user.full_name or user.email
         user.delete()
@@ -476,7 +585,7 @@ class AdminEventAssignBulkView(generics.CreateAPIView):
     permission_classes = (permissions.IsAuthenticated,)
 
     def create(self, request, *args, **kwargs):
-        if request.user.role != 'admin':
+        if not _is_full_admin(request.user):
             return Response({'error': 'Admin only'}, status=403)
         
         event_id = kwargs.get('event_id')
@@ -501,7 +610,7 @@ class AdminEventAssignBulkView(generics.CreateAPIView):
 
     def delete(self, request, *args, **kwargs):
         """Remove one or more ambassadors from an event without deleting them."""
-        if request.user.role != 'admin':
+        if not _is_full_admin(request.user):
             return Response({'error': 'Admin only'}, status=403)
 
         event_id = kwargs.get('event_id')
@@ -524,7 +633,7 @@ class AdminEventAnalyticsView(generics.RetrieveAPIView):
     permission_classes = (permissions.IsAuthenticated,)
 
     def get(self, request, *args, **kwargs):
-        if request.user.role != 'admin':
+        if not _can_view_admin_console(request.user):
             return Response({'error': 'Admin only'}, status=403)
         
         event_id = kwargs.get('event_id')
@@ -789,7 +898,7 @@ class AdminEventBulkGuestView(generics.CreateAPIView):
     serializer_class = OrganizerGuestSerializer
 
     def create(self, request, *args, **kwargs):
-        if request.user.role != 'admin':
+        if not _is_full_admin(request.user):
             return Response({'error': 'Admin only'}, status=403)
 
         event = Event.objects.filter(id=kwargs.get('event_id')).first()
@@ -865,7 +974,7 @@ class AdminEventGuestCreateView(generics.CreateAPIView):
     serializer_class = AdminGuestCreateSerializer
 
     def create(self, request, *args, **kwargs):
-        if request.user.role != 'admin':
+        if not _is_full_admin(request.user):
             return Response({'error': 'Admin only'}, status=403)
 
         event = Event.objects.filter(id=kwargs.get('event_id')).first()
@@ -938,7 +1047,7 @@ class AdminEventApiKeyListCreateView(generics.ListCreateAPIView):
     serializer_class = OrganizerAPIKeySerializer
 
     def get_queryset(self):
-        if self.request.user.role != 'admin':
+        if not _is_full_admin(self.request.user):
             return OrganizerAPIKey.objects.none()
         return OrganizerAPIKey.objects.filter(
             event_id=self.kwargs.get('event_id')
@@ -947,7 +1056,7 @@ class AdminEventApiKeyListCreateView(generics.ListCreateAPIView):
     def create(self, request, *args, **kwargs):
         from .serializers import OrganizerAPIKeyCreateSerializer
 
-        if request.user.role != 'admin':
+        if not _is_full_admin(request.user):
             return Response({'error': 'Admin only'}, status=403)
 
         event = Event.objects.filter(id=kwargs.get('event_id')).first()
@@ -989,11 +1098,13 @@ class AdminEventApiKeyDetailView(generics.DestroyAPIView):
     permission_classes = (permissions.IsAuthenticated,)
 
     def get_queryset(self):
-        if self.request.user.role != 'admin':
+        if not _is_full_admin(self.request.user):
             return OrganizerAPIKey.objects.none()
         return OrganizerAPIKey.objects.filter(event_id=self.kwargs.get('event_id'))
 
     def destroy(self, request, *args, **kwargs):
+        if not _is_full_admin(request.user):
+            return Response({'error': 'Admin only'}, status=403)
         key_record = self.get_object()
         key_record.is_active = False
         key_record.save(update_fields=['is_active'])
@@ -1019,16 +1130,16 @@ class EventCustomFieldsView(generics.RetrieveUpdateAPIView):
         event = Event.objects.get(id=event_id)
         
         # Check permissions
-        if self.request.user.role != 'admin':
+        if self.request.user.role not in ('admin', 'supervisor'):
             if not UserEventAccess.objects.filter(
                 user=self.request.user, event=event
             ).exists():
-                raise PermissionDenied("You don't have access to this event")
+                raise exceptions.PermissionDenied("You don't have access to this event")
         
         return event
 
     def update(self, request, *args, **kwargs):
-        if request.user.role != 'admin':
+        if not _is_full_admin(request.user):
             return Response({'error': 'Admin only'}, status=403)
         
         event = self.get_object()
@@ -1363,7 +1474,7 @@ class AdminReportsListView(APIView):
     permission_classes = (permissions.IsAuthenticated,)
 
     def get(self, request, *args, **kwargs):
-        if request.user.role != 'admin':
+        if not _can_view_admin_console(request.user):
             return Response({'error': 'Admin only'}, status=403)
 
         events = Event.objects.select_related('created_by').prefetch_related(
@@ -1410,7 +1521,7 @@ class AdminEventReportView(APIView):
     permission_classes = (permissions.IsAuthenticated,)
 
     def get(self, request, event_id, *args, **kwargs):
-        if request.user.role != 'admin':
+        if not _can_view_admin_console(request.user):
             return Response({'error': 'Admin only'}, status=403)
 
         try:
